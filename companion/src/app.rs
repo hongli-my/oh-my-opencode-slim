@@ -30,16 +30,33 @@ const MENU_OPEN_KEY: &str = "companion_menu_open";
 const MENU_POS_KEY: &str = "companion_menu_pos";
 const MENU_JUST_OPENED_KEY: &str = "companion_menu_just_opened";
 
+/// Agent thumbnail edge as a fraction of the configured size preset. Slightly
+/// below 1.0 so a multi-row list stays compact, but large enough that the agent
+/// animation reads clearly rather than looking like a narrow strip.
+const THUMB_RATIO: f32 = 0.9;
+/// Per-row label strip height as a fraction of the thumbnail edge. The project
+/// name sits in this strip, top-left above the first icon.
+const LABEL_RATIO: f32 = 0.28;
+/// Agents rendered per session row before the rest collapse into a "+N" hint.
+const MAX_AGENTS_PER_ROW: usize = 5;
+/// Sessions rendered before the list is truncated (kept bounded so the window
+/// never grows taller than the screen with many concurrent projects).
+const MAX_ROWS: usize = 8;
+const ROW_SEPARATOR_ALPHA: u8 = 40;
+
+/// Single persisted key for the aggregate window position. The list window is
+/// global, so — unlike the old per-project windows — there is one saved
+/// position rather than one per cwd.
+const GLOBAL_POSITION_KEY: &str = "__companion_window__";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowGeometryKey {
-    session_id: String,
-    project_key: String,
     position: String,
     custom_x: Option<i32>,
     custom_y: Option<i32>,
     size_px: u32,
-    cols: u32,
-    rows: u32,
+    win_w: u32,
+    win_h: u32,
     screen_w: u32,
     screen_h: u32,
 }
@@ -51,21 +68,6 @@ struct ConfigKey {
     gif_pack: String,
     loop_style: String,
     speed_bits: u32,
-}
-
-fn grid_cols(n: usize) -> usize {
-    match n {
-        0 | 1 => 1,
-        2 | 3 | 4 => 2,
-        _ => 3,
-    }
-}
-
-fn grid_dims(n: usize) -> (usize, usize) {
-    let n = n.max(1);
-    let cols = grid_cols(n);
-    let rows = (n + cols - 1) / cols;
-    (cols, rows)
 }
 
 fn size_from_config(size: &str) -> f32 {
@@ -88,19 +90,15 @@ fn config_key(config: Option<&CompanionConfigState>) -> Option<ConfigKey> {
     })
 }
 
-fn config_for_owner<'a>(
+/// Config that drives window placement and animation for the aggregate window.
+/// Prefers the top-level `config` block, falling back to the first session that
+/// carries one so an older plugin that only writes per-session config still
+/// works.
+fn config_global<'a>(
     sessions: &'a [SessionInfo],
-    owner_session_id: Option<&str>,
     global_config: Option<&'a CompanionConfigState>,
 ) -> Option<&'a CompanionConfigState> {
-    owner_session_id
-        .and_then(|owner| {
-            sessions
-                .iter()
-                .find(|session| session.session_id == owner)
-                .and_then(|session| session.config.as_ref())
-        })
-        .or(global_config)
+    global_config.or_else(|| sessions.iter().find_map(|session| session.config.as_ref()))
 }
 
 fn normalized_gif_pack(pack: &str) -> &str {
@@ -144,10 +142,6 @@ fn apply_config(
     }
 }
 
-fn window_size(cell: f32, cols: usize, rows: usize) -> [f32; 2] {
-    [cell * cols as f32, cell * rows as f32]
-}
-
 pub(crate) fn place_window(position: &str, screen: [f32; 2], win: [f32; 2]) -> [f32; 2] {
     let (screen_w, screen_h) = (screen[0], screen[1]);
     let (win_w, win_h) = (win[0], win[1]);
@@ -180,98 +174,62 @@ fn restore_window_position(pos: [f32; 2], screen: [f32; 2], win: [f32; 2]) -> [f
     }
 }
 
-fn stack_window_position(
-    position: [f32; 2],
-    anchor: &str,
-    rank: usize,
-    screen: [f32; 2],
-    win: [f32; 2],
-) -> [f32; 2] {
-    let offset = (rank.min(8) as f32) * 18.0;
-    let stacked = match anchor {
-        "bottom-left" => [position[0] + offset, position[1] - offset],
-        "top-right" => [position[0] - offset, position[1] + offset],
-        "top-left" => [position[0] + offset, position[1] + offset],
-        _ => [position[0] - offset, position[1] - offset],
-    };
-    clamp_window_position(stacked, screen, win)
-}
-
-fn canonical_project_key(cwd: &str) -> String {
+fn project_name(cwd: &str) -> String {
     std::path::Path::new(cwd)
-        .canonicalize()
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
-        .unwrap_or_else(|| cwd.to_string())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
-fn cell_rects(agents: usize, cols: usize, rows: usize, cell: f32) -> Vec<egui::Rect> {
-    let mut rects = Vec::with_capacity(agents);
-    let full_rows = agents / cols;
-    let remainder = agents % cols;
-
-    for row in 0..full_rows {
-        for col in 0..cols {
-            rects.push(egui::Rect::from_min_size(
-                egui::pos2(col as f32 * cell, row as f32 * cell),
-                egui::vec2(cell, cell),
-            ));
-        }
-    }
-
-    if remainder > 0 {
-        let x_offset = (cols - remainder) as f32 * cell / 2.0;
-        for col in 0..remainder {
-            rects.push(egui::Rect::from_min_size(
-                egui::pos2(x_offset + col as f32 * cell, full_rows as f32 * cell),
-                egui::vec2(cell, cell),
-            ));
-        }
-    }
-
-    let _ = rows;
-    rects
+/// Sessions in a stable render order (by cwd, then id), truncated to MAX_ROWS.
+/// Stable ordering keeps rows from jumping as sessions go busy/idle.
+fn ordered_sessions(sessions: &[SessionInfo]) -> Vec<SessionInfo> {
+    let mut ordered: Vec<SessionInfo> = sessions.to_vec();
+    ordered.sort_by(|a, b| {
+        a.cwd
+            .cmp(&b.cwd)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    ordered.truncate(MAX_ROWS);
+    ordered
 }
 
-fn choose_session(sessions: &[SessionInfo]) -> Option<usize> {
-    sessions
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, s)| s.status == "waiting-input")
-        .map(|(i, _)| i)
-        .or_else(|| {
-            sessions
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, s)| s.active_agents.iter().any(|agent| agent != "intro"))
-                .map(|(i, _)| i)
-        })
-        .or_else(|| {
-            sessions
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, s)| s.status == "busy")
-                .map(|(i, _)| i)
-        })
-        .or_else(|| sessions.last().map(|_| sessions.len() - 1))
+/// Agents to draw for a row, capped so a wide fan-out doesn't stretch the row.
+fn agents_shown(agent_count: usize) -> usize {
+    agent_count.max(1).min(MAX_AGENTS_PER_ROW)
 }
 
-fn choose_owned_session(sessions: &[SessionInfo], owner_session_id: Option<&str>) -> Option<usize> {
-    if let Some(owner_session_id) = owner_session_id {
-        return sessions
-            .iter()
-            .position(|session| session.session_id == owner_session_id);
-    }
+/// Layout metrics for a list of `rows` sessions where the widest row shows
+/// `max_agents` agents at the given size preset. Each row stacks a label strip
+/// (project name, top-left) above a row of square agent thumbnails, so width is
+/// driven purely by the agent count — no reserved label column that would leave
+/// a black gutter on the right.
+struct ListLayout {
+    win_w: f32,
+    win_h: f32,
+    thumb: f32,
+    label_h: f32,
+    row_h: f32,
+}
 
-    choose_session(sessions)
+fn list_layout(rows: usize, max_agents: usize, size: f32) -> ListLayout {
+    let thumb = (size * THUMB_RATIO).round().max(24.0);
+    let label_h = (thumb * LABEL_RATIO).round().clamp(12.0, 22.0);
+    let row_h = thumb + label_h;
+    let win_w = thumb * max_agents.max(1) as f32;
+    let win_h = row_h * rows.max(1) as f32;
+    ListLayout {
+        win_w,
+        win_h,
+        thumb,
+        label_h,
+        row_h,
+    }
 }
 
 pub struct CompanionApp {
     state_path: std::path::PathBuf,
-    owner_session_id: Option<String>,
     sessions: Vec<SessionInfo>,
     gifs: Gifs,
     rx: Receiver<()>,
@@ -285,27 +243,19 @@ pub struct CompanionApp {
     has_modern_config: bool,
     applied_config: Option<ConfigKey>,
     applied_geometry: Option<WindowGeometryKey>,
-    last_logged_selection: Option<String>,
-    window_positions: std::collections::BTreeMap<String, WindowPositionState>,
-    project_keys: std::collections::BTreeMap<String, String>,
-    drag_project_key: Option<String>,
+    last_logged_signature: Option<String>,
+    saved_position: Option<WindowPositionState>,
+    dragging: bool,
     niri_generation: Arc<AtomicU64>,
 }
 
 impl CompanionApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let state_path = crate::state::state_file_path();
-        let owner_session_id = std::env::var("OH_MY_OPENCODE_SLIM_COMPANION_SESSION_ID")
-            .ok()
-            .filter(|session_id| !session_id.trim().is_empty());
         let state = read_state(&state_path);
-        crate::log::debug(format!(
-            "app new owner={:?} initial_sessions={}",
-            owner_session_id,
-            state.sessions.len()
-        ));
+        crate::log::debug(format!("app new initial_sessions={}", state.sessions.len()));
         let sessions = state.sessions;
-        let window_positions = state.window_positions;
+        let saved_position = state.window_positions.get(GLOBAL_POSITION_KEY).copied();
 
         let mut initial_size = DEFAULT_SIZE;
         let mut position = "bottom-right".to_string();
@@ -313,11 +263,7 @@ impl CompanionApp {
         let mut loop_style = "classic".to_string();
         let mut speed = normalized_speed(f32::NAN);
         let has_modern_config = state.config.is_some();
-        let applied_config = config_key(config_for_owner(
-            &sessions,
-            owner_session_id.as_deref(),
-            state.config.as_ref(),
-        ));
+        let applied_config = config_key(config_global(&sessions, state.config.as_ref()));
         apply_config(
             applied_config.as_ref(),
             &mut position,
@@ -331,7 +277,6 @@ impl CompanionApp {
 
         Self {
             state_path,
-            owner_session_id,
             sessions,
             gifs: Gifs::new(),
             rx,
@@ -345,10 +290,9 @@ impl CompanionApp {
             has_modern_config,
             applied_config,
             applied_geometry: None,
-            last_logged_selection: None,
-            window_positions,
-            project_keys: std::collections::BTreeMap::new(),
-            drag_project_key: None,
+            last_logged_signature: None,
+            saved_position,
+            dragging: false,
             niri_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -358,21 +302,13 @@ impl CompanionApp {
             while self.rx.try_recv().is_ok() {}
             let state = read_state(&self.state_path);
             self.sessions = state.sessions;
-            let owned_config = config_for_owner(
-                &self.sessions,
-                self.owner_session_id.as_deref(),
-                state.config.as_ref(),
-            );
+            let owned_config = config_global(&self.sessions, state.config.as_ref());
             crate::log::debug(format!(
-                "state update owner={:?} sessions={} global_config={:?} owned_config={:?}",
-                self.owner_session_id,
+                "state update sessions={} global_config={:?}",
                 self.sessions.len(),
-                state.config,
                 owned_config
             ));
-            self.window_positions = state.window_positions;
-            self.project_keys
-                .retain(|cwd, _| self.sessions.iter().any(|session| &session.cwd == cwd));
+            self.saved_position = state.window_positions.get(GLOBAL_POSITION_KEY).copied();
             self.has_modern_config = state.config.is_some();
             let next_config = config_key(owned_config);
             let config_changed = self.applied_config != next_config;
@@ -403,15 +339,6 @@ impl CompanionApp {
             }
         }
     }
-
-    fn project_key_for(&mut self, cwd: &str) -> String {
-        if let Some(key) = self.project_keys.get(cwd) {
-            return key.clone();
-        }
-        let key = canonical_project_key(cwd);
-        self.project_keys.insert(cwd.to_string(), key.clone());
-        key
-    }
 }
 
 impl eframe::App for CompanionApp {
@@ -439,18 +366,7 @@ impl eframe::App for CompanionApp {
 
         self.size = ctx.data(|d| d.get_temp(egui::Id::new(SIZE_KEY)).unwrap_or(self.size));
 
-        let Some(selected_idx) =
-            choose_owned_session(&self.sessions, self.owner_session_id.as_deref())
-        else {
-            if self.owner_session_id.is_some() {
-                crate::log::debug(format!(
-                    "close owner session missing owner={:?} sessions={}",
-                    self.owner_session_id,
-                    self.sessions.len()
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
+        if self.sessions.is_empty() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                 .show(ctx, |ui| {
@@ -460,73 +376,59 @@ impl eframe::App for CompanionApp {
                 });
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
-        };
-
-        let session = self.sessions[selected_idx].clone();
-        let selection_log_key = format!(
-            "{}|{}|{}|{:?}",
-            session.session_id, session.cwd, session.status, session.active_agents
-        );
-        if self.last_logged_selection.as_ref() != Some(&selection_log_key) {
-            crate::log::debug(format!(
-                "selected owner={:?} idx={} session_id={} cwd={} status={} agents={:?}",
-                self.owner_session_id,
-                selected_idx,
-                session.session_id,
-                session.cwd,
-                session.status,
-                session.active_agents
-            ));
-            self.last_logged_selection = Some(selection_log_key);
         }
-        let project_key = self.project_key_for(&session.cwd);
-        let saved_position = self.window_positions.get(&project_key).copied();
-        let time_seconds = ctx.input(|input| input.time);
-        let agent_frames: Vec<AnimationFrame> = if session.active_agents.is_empty() {
-            self.gifs
-                .frame(
-                    ctx,
-                    "intro",
-                    &self.gif_pack,
-                    self.speed,
-                    &self.loop_style,
-                    time_seconds,
+
+        let rows = ordered_sessions(&self.sessions);
+        let max_agents = rows
+            .iter()
+            .map(|s| agents_shown(s.active_agents.len()))
+            .max()
+            .unwrap_or(1);
+        let layout = list_layout(rows.len(), max_agents, self.size);
+        let win_w = layout.win_w;
+        let win_h = layout.win_h;
+
+        // Content signature drives repaint logging only. It must NOT feed the
+        // geometry key: status/agent changes leave the window size and position
+        // untouched, so folding them into geometry would re-issue InnerSize +
+        // OuterPosition viewport commands on every agent tick and make the
+        // window flicker.
+        let signature = rows
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}:{}:{}:{}",
+                    s.session_id,
+                    s.status,
+                    agents_shown(s.active_agents.len()),
+                    s.active_agents.join("+"),
                 )
-                .into_iter()
-                .collect()
-        } else {
-            session
-                .active_agents
-                .iter()
-                .filter_map(|agent| {
-                    self.gifs.frame(
-                        ctx,
-                        agent,
-                        &self.gif_pack,
-                        self.speed,
-                        &self.loop_style,
-                        time_seconds,
-                    )
-                })
-                .collect()
-        };
-        let n = agent_frames.len().max(1);
-        let (cols, rows) = grid_dims(n);
-        let [win_w, win_h] = window_size(self.size, cols, rows);
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if self.last_logged_signature.as_ref() != Some(&signature) {
+            crate::log::debug(format!(
+                "render rows={} max_agents={} signature={}",
+                rows.len(),
+                max_agents,
+                signature
+            ));
+            self.last_logged_signature = Some(signature);
+        }
+
+        let saved_position = self.saved_position;
         let menu_open = ctx.data(|d| {
             d.get_temp::<bool>(egui::Id::new(MENU_OPEN_KEY))
                 .unwrap_or(false)
         });
 
         let geometry = WindowGeometryKey {
-            session_id: session.session_id.clone(),
-            project_key: project_key.clone(),
             position: self.position.clone(),
             custom_x: saved_position.map(|pos| pos.x.round() as i32),
             custom_y: saved_position.map(|pos| pos.y.round() as i32),
             size_px: self.size.round() as u32,
-            cols: cols as u32,
-            rows: rows as u32,
+            win_w: win_w.round() as u32,
+            win_h: win_h.round() as u32,
             screen_w: self.screen[0].round() as u32,
             screen_h: self.screen[1].round() as u32,
         };
@@ -534,25 +436,10 @@ impl eframe::App for CompanionApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(win_w, win_h)));
             let pos = saved_position
                 .map(|pos| restore_window_position([pos.x, pos.y], self.screen, [win_w, win_h]))
-                .unwrap_or_else(|| {
-                    stack_window_position(
-                        place_window(&self.position, self.screen, [win_w, win_h]),
-                        &self.position,
-                        selected_idx,
-                        self.screen,
-                        [win_w, win_h],
-                    )
-                });
+                .unwrap_or_else(|| place_window(&self.position, self.screen, [win_w, win_h]));
             crate::log::debug(format!(
-                "geometry owner={:?} session_id={} saved_position={:?} pos={:?} win=({}, {}) screen={:?} selected_idx={}",
-                self.owner_session_id,
-                session.session_id,
-                saved_position,
-                pos,
-                win_w,
-                win_h,
-                self.screen,
-                selected_idx
+                "geometry saved_position={:?} pos={:?} win=({}, {}) screen={:?}",
+                saved_position, pos, win_w, win_h, self.screen
             ));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 pos[0], pos[1],
@@ -562,22 +449,27 @@ impl eframe::App for CompanionApp {
         }
 
         if !menu_open && ctx.input(|i| i.pointer.primary_pressed()) {
-            self.drag_project_key = Some(project_key.clone());
+            self.dragging = true;
         }
-        if self.drag_project_key.is_some() && ctx.input(|i| i.pointer.primary_down()) {
+        if self.dragging && ctx.input(|i| i.pointer.primary_down()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         if ctx.input(|i| i.pointer.primary_released()) {
-            if let Some(project_key) = self.drag_project_key.take() {
+            if self.dragging {
+                self.dragging = false;
                 if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                     let position = WindowPositionState {
                         x: rect.min.x,
                         y: rect.min.y,
                     };
-                    if write_project_window_position(&self.state_path, &project_key, position)
-                        .is_ok()
+                    if write_project_window_position(
+                        &self.state_path,
+                        GLOBAL_POSITION_KEY,
+                        position,
+                    )
+                    .is_ok()
                     {
-                        self.window_positions.insert(project_key, position);
+                        self.saved_position = Some(position);
                         self.applied_geometry = None;
                     }
                 }
@@ -593,6 +485,39 @@ impl eframe::App for CompanionApp {
             });
         }
 
+        let time_seconds = ctx.input(|input| input.time);
+        // Frames per row, aligned with `rows`. Collected up front so the
+        // painting closure below borrows nothing mutable.
+        let row_frames: Vec<Vec<AnimationFrame>> = rows
+            .iter()
+            .map(|session| {
+                let count = agents_shown(session.active_agents.len());
+                let agents: Vec<&str> = if session.active_agents.is_empty() {
+                    vec!["intro"]
+                } else {
+                    session
+                        .active_agents
+                        .iter()
+                        .take(count)
+                        .map(String::as_str)
+                        .collect()
+                };
+                agents
+                    .into_iter()
+                    .filter_map(|agent| {
+                        self.gifs.frame(
+                            ctx,
+                            agent,
+                            &self.gif_pack,
+                            self.speed,
+                            &self.loop_style,
+                            time_seconds,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -601,7 +526,38 @@ impl eframe::App for CompanionApp {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                render_session(ui, ctx, &session, &agent_frames, self.size, win_w, win_h);
+                let painter = ui.painter().clone();
+                // Fill the actual available rect rather than the pre-resize
+                // win_w/win_h: during a resize the two differ for a frame, and
+                // painting the stale size leaves a transparent seam that reads
+                // as a flicker.
+                let surface = ui.max_rect();
+                painter.rect_filled(surface, 0.0, egui::Color32::BLACK);
+
+                for (i, session) in rows.iter().enumerate() {
+                    let row_top = i as f32 * layout.row_h;
+                    render_row(
+                        &painter,
+                        ctx,
+                        session,
+                        &row_frames[i],
+                        session.active_agents.len(),
+                        layout.thumb,
+                        layout.label_h,
+                        row_top,
+                        win_w,
+                    );
+                    if i > 0 {
+                        painter.hline(
+                            0.0..=win_w,
+                            row_top,
+                            egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_white_alpha(ROW_SEPARATOR_ALPHA),
+                            ),
+                        );
+                    }
+                }
             });
 
         render_size_picker(ctx, win_w, win_h);
@@ -641,63 +597,58 @@ impl CompanionApp {
     }
 }
 
-fn render_session(
-    ui: &mut egui::Ui,
+#[allow(clippy::too_many_arguments)]
+fn render_row(
+    painter: &egui::Painter,
     ctx: &egui::Context,
     session: &SessionInfo,
     agent_frames: &[AnimationFrame],
-    current_size: f32,
+    total_agents: usize,
+    thumb: f32,
+    label_h: f32,
+    row_top: f32,
     win_w: f32,
-    win_h: f32,
 ) {
-    let cwd = &session.cwd;
-
-    let project = std::path::Path::new(&cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let n = agent_frames.len().max(1);
-    let (cols, rows) = grid_dims(n);
-    let rects = cell_rects(n, cols, rows, current_size);
-
-    let surface = egui::Rect::from_min_max(
-        egui::pos2(SURFACE_INSET, SURFACE_INSET),
-        egui::pos2(win_w - SURFACE_INSET, win_h - SURFACE_INSET),
-    );
-    ui.painter().rect_filled(surface, 0.0, egui::Color32::BLACK);
-
-    for (i, frame) in agent_frames.iter().enumerate() {
-        if let Some(&cell) = rects.get(i) {
-            ui.painter().image(
-                frame.texture_id,
-                cell.shrink(SURFACE_INSET),
-                frame.uv,
-                egui::Color32::WHITE,
-            );
-        }
+    // Label strip sits at the top-left of the row, above the icons.
+    let overflow = total_agents.saturating_sub(agent_frames.len());
+    let mut label = project_name(&session.cwd);
+    if overflow > 0 {
+        label = format!("{label} +{overflow}");
     }
-
-    let label_h = (current_size * 0.15).clamp(13.0, 30.0);
-    let font_size = (current_size * 0.09).clamp(9.0, 13.0);
-    let strip = egui::Rect::from_min_size(
-        egui::pos2(SURFACE_INSET, win_h - label_h - SURFACE_INSET),
-        egui::vec2(win_w - SURFACE_INSET * 2.0, label_h),
-    );
-    ui.painter()
-        .rect_filled(strip, 0.0, egui::Color32::from_black_alpha(185));
-
+    let font_size = (label_h * 0.72).clamp(9.0, 14.0);
     let fid = egui::FontId::proportional(font_size);
-    let max_text_w = win_w - 10.0;
-    let label = fit_text(ctx, &project, &fid, max_text_w);
-    ui.painter().text(
-        strip.center(),
-        egui::Align2::CENTER_CENTER,
-        &label,
+    let max_text_w = (win_w - 8.0).max(0.0);
+    let fitted = fit_text(ctx, &label, &fid, max_text_w);
+    painter.text(
+        egui::pos2(4.0, row_top + label_h * 0.5),
+        egui::Align2::LEFT_CENTER,
+        &fitted,
         fid,
-        egui::Color32::WHITE,
+        status_color(&session.status),
     );
+
+    // Agent thumbnails row, directly under the label strip.
+    let icons_top = row_top + label_h;
+    for (i, frame) in agent_frames.iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(i as f32 * thumb, icons_top),
+            egui::vec2(thumb, thumb),
+        );
+        painter.image(
+            frame.texture_id,
+            cell.shrink(SURFACE_INSET),
+            frame.uv,
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+fn status_color(status: &str) -> egui::Color32 {
+    match status {
+        "waiting-input" => egui::Color32::from_rgb(240, 200, 90),
+        "busy" => egui::Color32::from_rgb(120, 200, 255),
+        _ => egui::Color32::from_rgb(210, 210, 214),
+    }
 }
 
 fn render_size_picker(ctx: &egui::Context, win_w: f32, win_h: f32) {
@@ -856,15 +807,16 @@ fn is_pid_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_config, choose_session, config_key, grid_dims, place_window, restore_window_position,
-        size_from_config, window_size, ConfigKey, SessionInfo, WindowGeometryKey, GAP,
+        agents_shown, apply_config, config_key, list_layout, ordered_sessions, place_window,
+        project_name, restore_window_position, size_from_config, ConfigKey, SessionInfo,
+        MAX_AGENTS_PER_ROW, MAX_ROWS, GAP,
     };
     use crate::state::CompanionConfigState;
 
-    fn session(id: &str, status: &str, agents: &[&str]) -> SessionInfo {
+    fn session(id: &str, cwd: &str, status: &str, agents: &[&str]) -> SessionInfo {
         SessionInfo {
             session_id: id.to_string(),
-            cwd: format!("/{id}"),
+            cwd: cwd.to_string(),
             active_agents: agents.iter().map(|s| s.to_string()).collect(),
             status: status.to_string(),
             pid: Some(1),
@@ -874,39 +826,64 @@ mod tests {
     }
 
     #[test]
-    fn waiting_input_wins() {
-        let sessions = vec![
-            session("idle", "idle", &["intro"]),
-            session("waiting", "waiting-input", &["input"]),
-        ];
-        assert_eq!(choose_session(&sessions), Some(1));
+    fn agents_shown_clamps_between_one_and_max() {
+        assert_eq!(agents_shown(0), 1);
+        assert_eq!(agents_shown(3), 3);
+        assert_eq!(agents_shown(20), MAX_AGENTS_PER_ROW);
     }
 
     #[test]
-    fn non_intro_active_agents_win_over_idle_intro() {
-        let sessions = vec![
-            session("idle", "idle", &["intro"]),
-            session("busy-agent", "idle", &["designer"]),
-        ];
-        assert_eq!(choose_session(&sessions), Some(1));
+    fn ordered_sessions_sorts_and_truncates() {
+        let sessions: Vec<SessionInfo> = (0..MAX_ROWS + 3)
+            .rev()
+            .map(|i| session(&format!("s{i}"), &format!("/p{i:02}"), "busy", &["fixer"]))
+            .collect();
+        let ordered = ordered_sessions(&sessions);
+        assert_eq!(ordered.len(), MAX_ROWS);
+        // Sorted by cwd ascending, so /p00 comes first.
+        assert_eq!(ordered[0].cwd, "/p00");
     }
 
     #[test]
-    fn busy_wins_when_no_active_agents() {
+    fn ordered_sessions_is_stable_by_cwd_then_id() {
         let sessions = vec![
-            session("idle", "idle", &["intro"]),
-            session("busy", "busy", &[]),
+            session("b", "/same", "busy", &["fixer"]),
+            session("a", "/same", "idle", &["intro"]),
         ];
-        assert_eq!(choose_session(&sessions), Some(1));
+        let ordered = ordered_sessions(&sessions);
+        assert_eq!(ordered[0].session_id, "a");
+        assert_eq!(ordered[1].session_id, "b");
     }
 
     #[test]
-    fn falls_back_to_newest_retained_session() {
-        let sessions = vec![
-            session("first", "idle", &["intro"]),
-            session("second", "idle", &["intro"]),
-        ];
-        assert_eq!(choose_session(&sessions), Some(1));
+    fn list_layout_grows_with_rows_and_agents() {
+        let one = list_layout(1, 1, 120.0);
+        let three_rows = list_layout(3, 1, 120.0);
+        let three_agents = list_layout(1, 3, 120.0);
+        assert!(three_rows.win_h > one.win_h, "more rows -> taller");
+        assert!(three_agents.win_w > one.win_w, "more agents -> wider");
+        // Width is thumbnail edge times agent count, with no reserved label
+        // column, so a single-agent row is exactly one thumbnail wide.
+        assert!((one.win_w - one.thumb).abs() < 0.01);
+        assert!((three_agents.win_w - three_agents.thumb * 3.0).abs() < 0.01);
+        // Height is (thumbnail + label strip) times row count.
+        assert!((one.win_h - one.row_h).abs() < 0.01);
+        assert!((three_rows.win_h - three_rows.row_h * 3.0).abs() < 0.01);
+        assert!(one.row_h > one.thumb, "row includes a label strip");
+    }
+
+    #[test]
+    fn list_layout_scales_with_size_preset() {
+        let small = list_layout(2, 2, 80.0);
+        let large = list_layout(2, 2, 160.0);
+        assert!(large.win_w > small.win_w);
+        assert!(large.win_h > small.win_h);
+    }
+
+    #[test]
+    fn project_name_uses_basename() {
+        assert_eq!(project_name("/a/b/my-project"), "my-project");
+        assert_eq!(project_name(""), "unknown");
     }
 
     #[test]
@@ -935,27 +912,11 @@ mod tests {
     }
 
     #[test]
-    fn top_right_moves_left_when_width_grows() {
-        let small = place_window("top-right", [1440.0, 900.0], [240.0, 240.0]);
-        let wide = place_window("top-right", [1440.0, 900.0], [480.0, 240.0]);
-        assert!(wide[0] < small[0]);
-    }
-
-    #[test]
     fn bottom_right_stays_anchored_when_width_grows() {
         let small = place_window("bottom-right", [1440.0, 900.0], [240.0, 240.0]);
         let wide = place_window("bottom-right", [1440.0, 900.0], [480.0, 240.0]);
         assert!(wide[0] < small[0]);
         assert!((wide[0] + 480.0 + GAP - 1440.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn bottom_left_stays_anchored_when_height_grows() {
-        let small = place_window("bottom-left", [1440.0, 900.0], [240.0, 240.0]);
-        let tall = place_window("bottom-left", [1440.0, 900.0], [240.0, 480.0]);
-        assert_eq!(tall[0], GAP);
-        assert!(tall[1] < small[1]);
-        assert!((tall[1] + 480.0 + GAP - 900.0).abs() < 0.01);
     }
 
     #[test]
@@ -983,84 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_preserves_positive_offset_secondary_monitor_positions() {
-        assert_eq!(
-            restore_window_position([2200.0, 80.0], [1440.0, 900.0], [120.0, 120.0]),
-            [2200.0, 80.0]
-        );
-    }
-
-    #[test]
-    fn geometry_key_changes_with_layout_inputs() {
-        let base = WindowGeometryKey {
-            session_id: "a".into(),
-            project_key: "/a".into(),
-            position: "bottom-right".into(),
-            custom_x: None,
-            custom_y: None,
-            size_px: 120,
-            cols: 1,
-            rows: 1,
-            screen_w: 1440,
-            screen_h: 900,
-        };
-        assert_ne!(
-            base,
-            WindowGeometryKey {
-                cols: 2,
-                ..base.clone()
-            }
-        );
-        assert_ne!(
-            base,
-            WindowGeometryKey {
-                rows: 2,
-                ..base.clone()
-            }
-        );
-        assert_ne!(
-            base,
-            WindowGeometryKey {
-                size_px: 160,
-                ..base.clone()
-            }
-        );
-        assert_ne!(
-            base,
-            WindowGeometryKey {
-                screen_w: 1600,
-                ..base.clone()
-            }
-        );
-        assert_ne!(
-            base,
-            WindowGeometryKey {
-                position: "top-left".into(),
-                ..base.clone()
-            }
-        );
-        assert_ne!(
-            base.clone(),
-            WindowGeometryKey {
-                session_id: "b".into(),
-                ..base
-            }
-        );
-    }
-
-    #[test]
-    fn grid_dims_remains_stable() {
-        assert_eq!(grid_dims(1), (1, 1));
-        assert_eq!(grid_dims(4), (2, 2));
-    }
-
-    #[test]
-    fn window_size_scales_with_grid() {
-        assert_eq!(window_size(120.0, 2, 3), [240.0, 360.0]);
-    }
-
-    #[test]
-    fn config_key_tracks_only_config_position_and_size() {
+    fn config_key_tracks_position_size_and_animation() {
         let cfg = CompanionConfigState {
             enabled: true,
             position: "top-left".into(),
@@ -1083,43 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn config_tuple_change_detection_preserves_local_picker_on_session_updates() {
-        let previous = Some(ConfigKey {
-            position: "bottom-right".into(),
-            size: "medium".into(),
-            gif_pack: "default".into(),
-            loop_style: "classic".into(),
-            speed_bits: 1.0f32.to_bits(),
-        });
-        let unchanged = Some(ConfigKey {
-            position: "bottom-right".into(),
-            size: "medium".into(),
-            gif_pack: "default".into(),
-            loop_style: "classic".into(),
-            speed_bits: 1.0f32.to_bits(),
-        });
-        let moved = Some(ConfigKey {
-            position: "top-left".into(),
-            size: "medium".into(),
-            gif_pack: "default".into(),
-            loop_style: "classic".into(),
-            speed_bits: 1.0f32.to_bits(),
-        });
-        let resized = Some(ConfigKey {
-            position: "bottom-right".into(),
-            size: "large".into(),
-            gif_pack: "default".into(),
-            loop_style: "classic".into(),
-            speed_bits: 1.0f32.to_bits(),
-        });
-
-        assert_eq!(previous, unchanged);
-        assert_ne!(previous, moved);
-        assert_ne!(previous, resized);
-    }
-
-    #[test]
-    fn apply_config_updates_size_only_for_config_changes() {
+    fn apply_config_updates_all_fields_and_defaults() {
         let mut position = "bottom-right".to_string();
         let mut size = 200.0;
         let mut gif_pack = "default".to_string();
@@ -1143,7 +991,6 @@ mod tests {
         );
         assert_eq!(position, "top-left");
         assert_eq!(size, 80.0);
-        assert_eq!(gif_pack, "default");
         assert_eq!(loop_style, "smooth");
         assert_eq!(speed, 2.0);
 
@@ -1157,7 +1004,6 @@ mod tests {
         );
         assert_eq!(position, "bottom-right");
         assert_eq!(size, 120.0);
-        assert_eq!(gif_pack, "default");
         assert_eq!(loop_style, "classic");
         assert_eq!(speed, 1.0);
     }

@@ -9,28 +9,12 @@ mod singleton;
 mod state;
 
 fn main() -> eframe::Result {
-    let Some(owner_session_id) = std::env::var("OH_MY_OPENCODE_SLIM_COMPANION_SESSION_ID")
-        .ok()
-        .filter(|session_id| !session_id.trim().is_empty())
-    else {
-        log::debug(format!(
-            "exit missing owner_session_id pid={}",
-            std::process::id()
-        ));
-        return Ok(());
-    };
+    log::debug(format!("start pid={}", std::process::id()));
 
-    log::debug(format!(
-        "start pid={} owner_session_id={}",
-        std::process::id(),
-        owner_session_id
-    ));
-
-    if !singleton::acquire(&owner_session_id) {
-        log::debug(format!(
-            "exit duplicate owner_session_id={}",
-            owner_session_id
-        ));
+    // A single companion window aggregates all OpenCode sessions, so only one
+    // instance runs globally regardless of how many processes try to spawn it.
+    if !singleton::acquire() {
+        log::debug(format!("exit duplicate pid={}", std::process::id()));
         return Ok(());
     }
 
@@ -58,9 +42,12 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "oh-my-opencode-slim-companion",
         options,
         Box::new(|cc| Ok(Box::new(app::CompanionApp::new(cc)))),
-    )
+    );
+
+    singleton::release();
+    result
 }
