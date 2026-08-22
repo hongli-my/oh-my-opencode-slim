@@ -67,9 +67,9 @@ interview/kanban-design-tool.md
 
 The file contains three sections:
 
-- `Frontmatter` — session meta data for recovery
-- `Current spec` — 11-section structured specification doc (Introduction, Purpose, Requirements, Data Contracts, Acceptance Criteria, etc.)
-- `Q&A history` — append-only question/answer record
+- `Frontmatter` - session meta data for recovery
+- `Current spec` - 11-section structured specification doc (Introduction, Purpose, Requirements, Data Contracts, Acceptance Criteria, etc.)
+- `Q&A history` - append-only question/answer record
 
 Example:
 
@@ -134,7 +134,7 @@ The interview module has two modes: **per-session** (default) and **dashboard** 
 
 ### Per-session mode (default)
 
-When `port` is `0` (or unset) and `dashboard` is `false` (or unset), each OpenCode process runs its own interview server on a random port. This is the original behavior — no configuration needed.
+When `port` is `0` (or unset) and `dashboard` is `false` (or unset), each OpenCode process runs its own interview server on a random port. This is the original behavior - no configuration needed.
 
 ```jsonc
 {
@@ -187,12 +187,18 @@ When `dashboard` is `true` or `port` is set to a value greater than `0`, intervi
             │ POST state        │ GET pending answers
 ┌───────────┴────────┐ ┌───────┴──────────────┐
 │  Session Process A  │ │  Session Process B    │
-│  (smart — drives    │ │  (smart — drives      │
+│  (smart - drives    │ │  (smart - drives      │
 │   LLM locally)      │ │   LLM locally)        │
 └─────────────────────┘ └───────────────────────┘
 ```
 
-Sessions are smart — they drive LLM interaction locally (parse state, inject prompts, write `.md` files). The dashboard is a dumb aggregator with a web UI. This means zero cross-process SDK dependency.
+Sessions are smart - they drive LLM interaction locally (parse state, inject prompts, write `.md` files). The dashboard is a dumb aggregator with a web UI. This means zero cross-process SDK dependency.
+
+Browser submissions use a claim/ack delivery protocol. A session claims an
+answer, chat message, block comment, or nudge before forwarding it to
+OpenCode; successful forwarding acknowledges the claim, while a rejected
+continuation rolls it back for a later retry. A failed poll therefore never
+silently drops a queued action.
 
 #### Auto-failover
 
@@ -204,7 +210,7 @@ Any OpenCode process can become the dashboard. The first process to bind the con
 
 #### Session registration
 
-Sessions register their project directory with the dashboard so it knows where to scan for interview files. This happens automatically on first `/interview` command or session event — no manual setup needed.
+Sessions register their project directory with the dashboard so it knows where to scan for interview files. This happens automatically on first `/interview` command or session event - no manual setup needed.
 
 The dashboard also scans your home directory's output folder by default, so interviews created from a home-directory OpenCode session are always visible.
 
@@ -212,9 +218,9 @@ The dashboard also scans your home directory's output folder by default, so inte
 
 The dashboard page includes a settings panel for:
 
-- **Scan days** — how far back to look for sessions (default: 30)
-- **Add/remove folders** — manually add project directories to scan
-- **Discover sessions** — re-scan the OpenCode session list for new directories
+- **Scan days** - how far back to look for sessions (default: 30)
+- **Add/remove folders** - manually add project directories to scan
+- **Discover sessions** - re-scan the OpenCode session list for new directories
 
 ## Configuration
 
@@ -234,19 +240,23 @@ The dashboard page includes a settings panel for:
 
 ### Options
 
-- `maxQuestions` — max questions per round, `1-10`, default `2`
-- `outputFolder` — where markdown files are written, default `interview`
-- `autoOpenBrowser` — open the localhost UI in your default browser during interactive runs, default `true` (suppressed automatically in tests and CI)
-- `port` — port for the interview server, `0-65535`, default `0` (OS-assigned in per-session mode). Set a fixed port to enable dashboard mode. Note: ports 1-1023 require elevated privileges on most systems.
-- `dashboard` — enable dashboard mode on the default port (`43211`), default `false`. Setting `port` to a value greater than `0` also enables dashboard mode. If both are set, `port` takes precedence.
+- `maxQuestions` - max questions per round, `1-10`, default `2`
+- `outputFolder` - where markdown files are written, default `interview`
+- `autoOpenBrowser` - open the localhost UI in your default browser during interactive runs, default `true` (suppressed automatically in tests and CI)
+- `port` - port for the interview server, `0-65535`, default `0` (OS-assigned in per-session mode). Set a fixed port to enable dashboard mode. Note: ports 1-1023 require elevated privileges on most systems.
+- `dashboard` - enable dashboard mode on the default port (`43211`), default `false`. Setting `port` to a value greater than `0` also enables dashboard mode. If both are set, `port` takes precedence.
 
 ### Mode selection
 
 | `port` | `dashboard` | Mode |
 |--------|-------------|------|
-| `0` (default) | `false` (default) | Per-session — each process runs its own server |
+| `0` (default) | `false` (default) | Per-session - each process runs its own server |
 | `0` | `true` | Dashboard on default port 43211 |
 | `> 0` | any | Dashboard on the specified port |
+
+The v2 bridge receives the resolved values for all five interview options, so
+`maxQuestions`, `outputFolder`, `autoOpenBrowser`, `port`, and `dashboard` are
+also honored when OpenCode loads the v2 plugin entry point.
 
 ## Remote access
 
@@ -280,7 +290,8 @@ ssh -L <port>:127.0.0.1:<port> your-server
 ## Current limitations
 
 - localhost UI only
-- browser updates use polling, not realtime push
+- per-session browser updates use polling; dashboard pages also receive SSE
+  state pushes with polling fallback
 - runtime interview state is in-memory; the markdown file is the durable artifact
 - the flow depends on the assistant returning valid `<interview_state>` blocks
 - dashboard mode answer delivery has a few seconds of latency (session polls the dashboard)
@@ -290,3 +301,20 @@ ssh -L <port>:127.0.0.1:<port> your-server
 - [README.md](../README.md)
 - [tools.md](tools.md)
 - [configuration.md](configuration.md)
+
+## OpenCode v2
+
+On OpenCode v2, `/interview` uses an orchestrator-owned marker command and a
+context bridge. Only the trailing marker message is rewritten, preserving the
+provider cache prefix; streamed text events build the interview transcript in
+memory. The bridge uses the v2 session methods for notifications, continuation,
+and renaming without expanding the global client shim.
+
+Selecting **Complete** asks for clean final markdown. The next clean assistant
+response replaces only `Current spec`; frontmatter and append-only `Q&A
+history` are retained, so stale `<interview_state>` output cannot overwrite the
+final document.
+
+In dashboard mode, session clients register at `/api/register` and unregister
+at `/api/unregister` during cleanup. Browser submissions return HTTP `202` with
+`{ "status": "queued" }`; the owning session processes them when idle.

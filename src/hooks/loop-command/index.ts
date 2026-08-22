@@ -1,4 +1,5 @@
 import { createInternalAgentTextPart } from '../../utils';
+import { registerCommandHook } from '../command-hook-utils';
 
 const COMMAND_NAME = 'loop';
 
@@ -14,7 +15,7 @@ function activationPrompt(text: string): string {
   return [
     'The user ran `/loop`. From the text below, extract: goal, successCriteria, maxAttempts.',
     '',
-    'If ANY are missing or unclear — push back and ask the user to clarify.',
+    'If ANY are missing or unclear - push back and ask the user to clarify.',
     'Do not assume or guess. All three must be explicit.',
     '',
     'Once all three are clear, run the loop:',
@@ -52,14 +53,12 @@ export function createLoopCommandHook(): {
 } {
   return {
     registerCommand: (opencodeConfig) => {
-      const cfg = opencodeConfig.command as Record<string, unknown> | undefined;
-      if (cfg?.[COMMAND_NAME]) return;
-      if (!opencodeConfig.command) opencodeConfig.command = {};
-      (opencodeConfig.command as Record<string, unknown>)[COMMAND_NAME] = {
-        template: 'Run an automated execute-verify loop',
-        description:
-          'Dispatch fixer, verify, iterate with file-based history on disk.',
-      };
+      registerCommandHook(
+        opencodeConfig,
+        COMMAND_NAME,
+        'Run an automated execute-verify loop',
+        'Dispatch fixer, verify, iterate with file-based history on disk.',
+      );
     },
 
     handleCommandExecuteBefore: async (input, output) => {

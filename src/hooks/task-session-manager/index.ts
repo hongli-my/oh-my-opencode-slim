@@ -1,157 +1,177 @@
-import path from 'node:path';
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
   BackgroundJobBoard,
-  type BackgroundJobRecord,
-  type ContextFile,
+  type BackgroundJobExecution,
+  type BackgroundJobStore,
+  type BackgroundJobSupervisor,
+  clearBackgroundJobSuppression,
   deriveTaskSessionLabel,
+  getBackgroundJobLifecycleLedger,
+  isInternalInitiatorPart,
   parseTaskIdFromTaskOutput,
-  parseTaskLaunchOutput,
-  parseTaskStatusOutput,
-  SLIM_INTERNAL_INITIATOR_MARKER,
+  parseTaskStateFromOutput,
+  recordBackgroundJobSuppression,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
-import { log } from '../../utils/logger';
-import { isRateLimitError } from '../foreground-fallback/index';
+import type { SessionLifecycle } from '../session-lifecycle';
+import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
-  isUserMessageWithParts,
-  type MessagePart,
-  type MessageWithParts,
-} from '../types';
+  BACKGROUND_JOB_BOARD_METADATA_KEY,
+  type InjectedTerminalJobs,
+  type InjectionState,
+  injectBackgroundJobBoard,
+  observeSyntheticTerminalPart,
+  reconcileInjectedTerminalJobs,
+  stabilizeRunningTaskParts,
+  updateFromInjectedCompletion,
+} from './board-injection';
+import { handleEvent } from './event-router';
+import { createIdleReconciler } from './idle-reconciliation';
+import { createIdleSessionTokens } from './idle-session-tokens';
+import { createInputWaitTracker } from './input-wait-tracker';
+import { createPendingCallTracker } from './pending-call-tracker';
+import type { RevivedRunTracker } from './revived-run-tracker';
+import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
+import { createTaskContextTracker } from './task-context-tracker';
+import {
+  handleToolExecuteAfter,
+  handleToolExecuteBefore,
+} from './tool-execute-hooks';
 
-interface TaskArgs {
-  description?: unknown;
-  prompt?: unknown;
-  subagent_type?: unknown;
-  task_id?: unknown;
-}
-
-interface PendingTaskCall {
-  callId: string;
-  parentSessionId: string;
-  agentType: string;
-  label: string;
-  resumedTaskId?: string;
-}
-
-const MAX_PENDING_TASK_CALLS = 100;
-
-interface PendingContextFile {
-  path: string;
-  lines: Set<number>;
-  lastReadAt: number;
-}
-
-const BACKGROUND_JOB_BOARD_SENTINEL = 'SENTINEL: background-job-board-v2';
-const BACKGROUND_COMPLETION_COMPLETED = /^Background task completed: /;
-const BACKGROUND_COMPLETION_FAILED = /^Background task failed: /;
-const MAX_PROCESSED_INJECTED_COMPLETIONS = 500;
-const RAW_SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
+export { BACKGROUND_JOB_BOARD_METADATA_KEY } from './board-injection';
 
 /**
- * Simple deterministic string hash for stable occurrence IDs.
- * Uses DJB2 algorithm - fast and good distribution for short strings.
+ * Delay before recording an idle observation on a child job. The observation
+ * remains provisional; terminal task output is the only path that establishes
+ * completed/error/cancelled state.
  */
-function djb2Hash(str: string): string {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) + hash + str.charCodeAt(i); // hash * 33 + char
-  }
-  // Convert to unsigned 32-bit and then to hex
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
+const IDLE_RECONCILE_DELAY_MS = 2_000;
 
-/**
- * Create a stable occurrence ID for synthetic completion deduplication.
- * Prefers part.id, then message.info.id + partIndex, then content-derived hash.
- */
-function createOccurrenceId(
-  part: MessagePart,
-  message: MessageWithParts,
-  partIndex: number,
-): string {
-  // Prefer explicit part.id if available
-  if (typeof part.id === 'string') {
-    return part.id;
-  }
+const RECOVERED_TASK_AGENT_FALLBACK = 'unknown';
 
-  // Fall back to message.info.id + partIndex
-  if (typeof message.info.id === 'string') {
-    return `${message.info.id}:${partIndex}`;
-  }
+function rehydrateHistoricalRunningTasks(
+  messages: unknown[],
+  backgroundJobBoard: BackgroundJobStore,
+  shouldManageSession: (sessionID: string) => boolean,
+  registerSessionAsOrchestrator?: (sessionID: string) => void,
+  rehydrateTombstones?: ReadonlySet<string>,
+): number {
+  let rehydrated = 0;
+  const managedOrchestratorSessionIDs = new Set<string>();
 
-  // Final fallback: content-derived hash from sessionID + parsed taskID/state/result
-  // This ensures the same anonymous synthetic completion is deduped
-  // even when its message index changes between transform calls
-  const sessionID = message.info.sessionID ?? 'unknown';
-  const content = typeof part.text === 'string' ? part.text : '';
+  for (const message of messages) {
+    if (!isMessageWithParts(message)) continue;
+    if (message.info.agent !== 'orchestrator') continue;
 
-  // Parse task status to get stable identifiers
-  const status = parseTaskStatusOutput(content);
-  if (status) {
-    // Use taskID + state + result for a stable hash
-    const stableKey = `${sessionID}:${status.taskID}:${status.state}:${status.result ?? ''}`;
-    const hash = djb2Hash(stableKey);
-    return `anon:${hash}`;
+    const parentSessionID = message.info.sessionID;
+    if (!parentSessionID) continue;
+    if (!shouldManageSession(parentSessionID)) {
+      registerSessionAsOrchestrator?.(parentSessionID);
+      if (!shouldManageSession(parentSessionID)) continue;
+    }
+    managedOrchestratorSessionIDs.add(parentSessionID);
   }
 
-  // Fallback to hashing the full content if parsing fails
-  const hash = djb2Hash(`${sessionID}:${content}`);
-  return `anon:${hash}`;
-}
+  for (const message of messages) {
+    if (!isMessageWithParts(message)) continue;
 
-function extractPath(output: string): string | undefined {
-  return /<path>([^<]+)<\/path>/.exec(output)?.[1];
-}
+    const parentSessionID = message.info.sessionID;
+    if (
+      !parentSessionID ||
+      !managedOrchestratorSessionIDs.has(parentSessionID)
+    ) {
+      continue;
+    }
 
-function extractTaskSummary(output: string): string | undefined {
-  const summary = /<summary>\s*([\s\S]*?)\s*<\/summary>/i.exec(output)?.[1];
-  return summary?.trim() || undefined;
-}
+    for (const part of message.parts) {
+      if (part.type !== 'tool' || part.tool !== 'task') continue;
+      if (!isObjectRecord(part.state)) continue;
 
-function normalizePath(root: string, file: string): string {
-  const relative = path.relative(root, file);
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-    return file;
+      const state = part.state;
+      if (typeof state.output !== 'string') continue;
+      if (!isObjectRecord(state.input) || state.input.background !== true) {
+        continue;
+      }
+
+      const taskID = parseTaskIdFromTaskOutput(state.output);
+      if (!taskID || parseTaskStateFromOutput(state.output) !== 'running') {
+        continue;
+      }
+      if (rehydrateTombstones?.has(taskID)) {
+        // A real session.deleted already invalidated this run. Do not turn its
+        // persisted running tool part into a fresh alias on the next request.
+        continue;
+      }
+      if (backgroundJobBoard.get(taskID)) continue;
+
+      const agent =
+        typeof state.input.subagent_type === 'string' &&
+        state.input.subagent_type.trim() !== ''
+          ? state.input.subagent_type.trim()
+          : RECOVERED_TASK_AGENT_FALLBACK;
+      const description =
+        typeof state.input.description === 'string'
+          ? state.input.description
+          : undefined;
+      const prompt =
+        typeof state.input.prompt === 'string' ? state.input.prompt : undefined;
+      const label = deriveTaskSessionLabel({
+        description,
+        prompt,
+        agentType: agent,
+      });
+
+      backgroundJobBoard.registerLaunch({
+        taskID,
+        parentSessionID,
+        agent,
+        description: label,
+        objective: label,
+        background: true,
+        preserveRun: true,
+        // Historical parts do not carry a trustworthy launch timestamp. Zero
+        // also prevents this registration from looking like a live observation
+        // to the first runtime-status reconciliation.
+        now: 0,
+      });
+      rehydrated += 1;
+    }
   }
-  return relative;
-}
 
-function extractReadFiles(
-  root: string,
-  output: { output: unknown; metadata?: unknown },
-): ContextFile[] {
-  if (typeof output.output !== 'string') return [];
-
-  const file = extractPath(output.output);
-  if (!file) return [];
-
-  return [
-    {
-      path: normalizePath(root, file),
-      lineCount: countReadLines(output.output).length,
-      lineNumbers: countReadLines(output.output),
-      lastReadAt: Date.now(),
-    },
-  ];
-}
-
-function countReadLines(output: string): number[] {
-  const lines = new Set<number>();
-  for (const match of output.matchAll(/^([0-9]+):/gm)) {
-    lines.add(Number(match[1]));
-  }
-  return [...lines];
+  return rehydrated;
 }
 
 export function createTaskSessionManagerHook(
   _ctx: PluginInput,
   options: {
+    strategy?: 'latest' | 'checkpoint-compatible';
     maxSessionsPerAgent: number;
+    maxRetainedSnapshots: number;
     readContextMinLines?: number;
     readContextMaxFiles?: number;
-    backgroundJobBoard?: BackgroundJobBoard;
+    backgroundJobBoard?: BackgroundJobStore;
+    backgroundJobSupervisor?: BackgroundJobSupervisor;
     shouldManageSession: (sessionID: string) => boolean;
+    /** Register a session as orchestrator when the transform hook detects
+     *  an orchestrator message but the session isn't in the agent map yet. */
+    registerSessionAsOrchestrator?: (sessionID: string) => void;
+    /** Optional guard: when provided, idle events for a session that is
+     *  currently undergoing a foreground-fallback abort/re-prompt cycle
+     *  will NOT trigger idle reconciliation. prevents marking a still-
+     *  active child job as completed when the session was aborted for
+     *  model fallback rather than natural completion. */
+    isFallbackInProgress?: (sessionID: string) => boolean;
+    /** True when foreground fallback could still recover the session
+     *  (enabled, chain exists, chain not exhausted). Lets the event
+     *  router defer terminal bookkeeping for persistent 401/410 errors
+     *  until recovery is impossible. */
+    willAttemptFallback?: (sessionID: string) => boolean;
+    coordinator?: SessionLifecycle;
+    /** Test seam only; production always uses the reconciliation delay. */
+    idleReconcileDelayMs?: number;
+    /** Test seam only; production uses the runtime reconciliation delay. */
+    runtimeStatusReconcileDelayMs?: number;
+    revivedRunTracker?: RevivedRunTracker;
   },
 ) {
   const backgroundJobBoard =
@@ -161,484 +181,254 @@ export function createTaskSessionManagerHook(
       readContextMinLines: options.readContextMinLines,
       readContextMaxFiles: options.readContextMaxFiles,
     });
-  const pendingCalls = new Map<string, PendingTaskCall>();
-  const pendingCallOrder: string[] = [];
-  const contextByTask = new Map<string, Map<string, PendingContextFile>>();
-  const pendingManagedTaskIds = new Set<string>();
-  const terminalJobsInjectedByParent = new Map<string, Set<string>>();
-  const processedInjectedCompletions = new Set<string>();
-  const processedInjectedCompletionOrder: string[] = [];
-  let anonymousPendingCallId = 0;
+  const rehydrateState = getBackgroundJobLifecycleLedger(backgroundJobBoard);
+  const rehydrateTombstones = rehydrateState.tombstones;
 
-  function addTaskContext(taskId: string, files: ContextFile[]): void {
-    if (files.length === 0) return;
+  const rememberDeletedSession = (sessionID: string): void => {
+    const remember = (taskID: string): void => {
+      recordBackgroundJobSuppression(backgroundJobBoard, taskID);
+    };
 
-    let context = contextByTask.get(taskId);
-    if (!context) {
-      context = new Map();
-      contextByTask.set(taskId, context);
+    // The delete event itself is the lifecycle boundary. Keep a tombstone
+    // even if an earlier cleanup already removed the board record.
+    remember(sessionID);
+    for (const job of backgroundJobBoard.list(sessionID)) {
+      remember(job.taskID);
     }
-    for (const file of files) {
-      const pending = context.get(file.path) ?? {
-        path: file.path,
-        lines: new Set<number>(),
-        lastReadAt: file.lastReadAt,
-      };
-      for (const line of file.lineNumbers ?? []) {
-        pending.lines.add(line);
+  };
+
+  const pendingCallTracker = createPendingCallTracker({
+    releaseLease: (lease) => backgroundJobBoard.releaseLease(lease),
+  });
+  const taskContextTracker = createTaskContextTracker();
+
+  const terminalJobsInjectedByParent = new Map<string, InjectedTerminalJobs>();
+  const pendingInjectedTerminalJobsByParent = new Map<
+    string,
+    Map<string, BackgroundJobExecution>
+  >();
+  /** Managed sessions with a deferred inline 401/410 awaiting fallback outcome. */
+  const deferredInlineErrors = new Set<string>();
+
+  // Forward refs for circular deps — set after corresponding managers exist.
+  // These are captured by closure in createIdleReconciler and only called
+  // at runtime (event handlers), well after initialization completes.
+  let getIdleSessionToken: (sessionID: string) => symbol = () => {
+    throw new Error('unreachable: getIdleSessionToken not initialized');
+  };
+  let isCurrentIdleSessionToken: (
+    sessionID: string,
+    sessionToken: symbol,
+  ) => boolean = () => false;
+  let hasInputWait: (sessionID: string) => boolean = () => false;
+
+  const idleReconciler = createIdleReconciler({
+    backgroundJobBoard,
+    reconcileInjectedTerminalJobs: (parentSessionID: string) =>
+      reconcileInjectedTerminalJobs(injectionState, parentSessionID),
+    // Fallback could not recover a deferred 401/410; drop the deferred
+    // error and its injected-terminal tracking so the board shows the
+    // failure and follow-up reconciliation keeps consistent state.
+    onErrorTerminalize: (sessionID: string) => {
+      deferredInlineErrors.delete(sessionID);
+      terminalJobsInjectedByParent.delete(sessionID);
+      pendingInjectedTerminalJobsByParent.delete(sessionID);
+    },
+    idleReconcileDelayMs:
+      options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
+    isFallbackInProgress: options.isFallbackInProgress,
+    hasInputWait: (s) => hasInputWait(s),
+    getIdleSessionToken: (s) => getIdleSessionToken(s),
+    isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
+    taskContextTracker,
+    revivedRunTracker: options.revivedRunTracker,
+  });
+  const runtimeStatusReconciler = createRuntimeStatusReconciler({
+    input: _ctx,
+    backgroundJobBoard,
+    delayMs: options.runtimeStatusReconcileDelayMs,
+    taskContextTracker,
+  });
+
+  const idleSessionTokens = createIdleSessionTokens({
+    onInvalidate: idleReconciler.onInvalidateIdle,
+  });
+  getIdleSessionToken = (s) => idleSessionTokens.getSessionToken(s);
+  isCurrentIdleSessionToken = (s, t) =>
+    idleSessionTokens.isCurrentSessionToken(s, t);
+
+  const inputWaits = createInputWaitTracker({
+    shouldManageSession: options.shouldManageSession,
+    invalidateIdle: (sessionID) => idleSessionTokens.invalidate(sessionID),
+  });
+  hasInputWait = (s) => inputWaits.hasInputWait(s);
+
+  if (options.coordinator) {
+    options.coordinator.onSessionDeleted((sessionId) => {
+      // Fallback teardown keeps process-global wait_for_user; genuine delete
+      // clears it via clearSession.
+      if (options.isFallbackInProgress?.(sessionId)) {
+        idleSessionTokens.invalidate(sessionId);
+      } else {
+        idleSessionTokens.clearSession(sessionId);
       }
-      pending.lastReadAt = Math.max(pending.lastReadAt, file.lastReadAt);
-      context.set(file.path, pending);
-    }
-
-    backgroundJobBoard.addContext(taskId, contextFilesForPrompt(context));
-  }
-
-  function contextFilesForPrompt(
-    context: Map<string, PendingContextFile> | undefined,
-  ): ContextFile[] {
-    if (!context) return [];
-    return [...context.values()].map((file) => ({
-      path: file.path,
-      lineCount: file.lines.size,
-      lastReadAt: file.lastReadAt,
-    }));
-  }
-
-  function canTrackTaskContext(taskId: string): boolean {
-    return (
-      pendingManagedTaskIds.has(taskId) ||
-      backgroundJobBoard.taskIDs().has(taskId)
-    );
-  }
-
-  function pruneContext(): void {
-    const remembered = backgroundJobBoard.taskIDs();
-    for (const taskId of contextByTask.keys()) {
-      if (!pendingManagedTaskIds.has(taskId) && !remembered.has(taskId)) {
-        contextByTask.delete(taskId);
+      inputWaits.clearInputWaits(sessionId);
+      idleReconciler.clearIdleTimers(sessionId);
+      // During a foreground fallback abort/re-prompt cycle, the session
+      // is being torn down and immediately recreated with a fallback model.
+      // Dropping the job from the board here would make the orchestrator
+      // lose track of the task and report it as cancelled even though the
+      // oracle actually completed.
+      if (!options.isFallbackInProgress?.(sessionId)) {
+        options.backgroundJobSupervisor?.onSessionDeleted(sessionId);
+        const hardTimedOut =
+          backgroundJobBoard.field(sessionId, 'deadlineExceededAt') !==
+          undefined;
+        if (!hardTimedOut) {
+          rememberDeletedSession(sessionId);
+          backgroundJobBoard.drop(sessionId);
+        }
+        options.backgroundJobSupervisor?.clearParent(sessionId);
+        backgroundJobBoard.clearParent(sessionId);
+        if (!hardTimedOut) options.backgroundJobSupervisor?.drop(sessionId);
       }
-    }
-  }
-
-  function updateBackgroundJobFromOutput(
-    output: unknown,
-  ): BackgroundJobRecord | undefined {
-    if (typeof output !== 'string') return undefined;
-
-    const status = parseTaskStatusOutput(output);
-    if (!status) return undefined;
-
-    log('[task-session-manager] parsed task output status', {
-      taskID: status.taskID,
-      state: status.state,
-      timedOut: status.timedOut,
-      hasResult: Boolean(status.result),
+      terminalJobsInjectedByParent.delete(sessionId);
+      pendingInjectedTerminalJobsByParent.delete(sessionId);
+      injectionState.retainedBoardSnapshots.delete(sessionId);
+      injectionState.retainedTailBoards.delete(sessionId);
+      taskContextTracker.clearSession(sessionId);
+      taskContextTracker.prune(backgroundJobBoard);
+      pendingCallTracker.clearSession(sessionId);
     });
-
-    const existing = backgroundJobBoard.get(status.taskID);
-    if (isLateCancelledTaskError(existing, status.state)) {
-      log('[task-session-manager] suppressed late cancelled task error', {
-        taskID: status.taskID,
-        alias: existing?.alias,
-        state: existing?.state,
-        terminalState: existing?.terminalState,
-        result: status.result,
-      });
-      return existing;
-    }
-
-    const updated = backgroundJobBoard.updateStatus({
-      taskID: status.taskID,
-      state: status.state,
-      timedOut: status.timedOut,
-      resultSummary: status.result,
-    });
-    if (!updated) {
-      log('[task-session-manager] ignored status for unknown background job', {
-        taskID: status.taskID,
-        state: status.state,
-      });
-      return undefined;
-    }
-
-    log('[task-session-manager] background job status updated', {
-      taskID: updated.taskID,
-      alias: updated.alias,
-      parentSessionID: updated.parentSessionID,
-      state: updated.state,
-      terminalUnreconciled: updated.terminalUnreconciled,
-      timedOut: updated.timedOut,
-    });
-
-    if (updated.terminalUnreconciled) {
-      pendingManagedTaskIds.delete(updated.taskID);
-      backgroundJobBoard.addContext(
-        updated.taskID,
-        contextFilesForPrompt(contextByTask.get(updated.taskID)),
-      );
-      pruneContext();
-    }
-
-    return updated;
   }
 
-  function updateFromInjectedCompletion(
-    part: MessagePart,
-    message: MessageWithParts,
-    _messageIndex: number,
-    partIndex: number,
-  ): BackgroundJobRecord | undefined {
-    if (part.type !== 'text' || typeof part.text !== 'string') {
-      return undefined;
-    }
-
-    if (part.synthetic !== true) return undefined;
-
-    const status = parseTaskStatusOutput(part.text);
-    if (!status) return undefined;
-    if (status.state !== 'completed' && status.state !== 'error') {
-      return undefined;
-    }
-
-    const summary = extractTaskSummary(part.text);
-    const isCompleted = summary
-      ? BACKGROUND_COMPLETION_COMPLETED.test(summary)
-      : status.state === 'completed';
-    const isFailed = summary
-      ? BACKGROUND_COMPLETION_FAILED.test(summary)
-      : status.state === 'error';
-    if (summary && !isCompleted && !isFailed) return undefined;
-
-    const occurrenceId = createOccurrenceId(part, message, partIndex);
-
-    const existing = backgroundJobBoard.get(status.taskID);
-    if (isFailed && isLateCancelledTaskError(existing, status.state)) {
-      part.text = formatCancelledTaskStatusOutput(
-        status.taskID,
-        existing?.resultSummary,
-      );
-      log('[task-session-manager] normalized late cancelled injected failure', {
-        taskID: status.taskID,
-        alias: existing?.alias,
-        state: existing?.state,
-        terminalState: existing?.terminalState,
-        result: status.result,
-      });
-      rememberProcessedInjectedCompletion(occurrenceId);
-      return existing;
-    }
-
-    // Enforce summary/state consistency when upstream includes a completion
-    // summary. Current upstream renders synthetic completions as task XML with
-    // the completion/failure label inside <summary> rather than as the first
-    // line of text.
-    if (isCompleted && status.state !== 'completed') return undefined;
-    if (isFailed && status.state !== 'error') return undefined;
-
-    // Dedupe by synthetic message occurrence using stable occurrence ID
-    if (processedInjectedCompletions.has(occurrenceId)) return undefined;
-
-    const updated = updateBackgroundJobFromOutput(part.text);
-    if (!updated) return undefined;
-
-    log('[task-session-manager] processed injected background completion', {
-      taskID: updated.taskID,
-      alias: updated.alias,
-      parentSessionID: updated.parentSessionID,
-      state: updated.state,
-      occurrenceId,
-    });
-
-    rememberProcessedInjectedCompletion(occurrenceId);
-    return updated;
-  }
-
-  function rememberProcessedInjectedCompletion(signature: string): void {
-    processedInjectedCompletions.add(signature);
-    processedInjectedCompletionOrder.push(signature);
-
-    while (
-      processedInjectedCompletionOrder.length >
-      MAX_PROCESSED_INJECTED_COMPLETIONS
-    ) {
-      const evicted = processedInjectedCompletionOrder.shift();
-      if (!evicted) break;
-      processedInjectedCompletions.delete(evicted);
-    }
-  }
-
-  function isMissingRememberedSessionError(output: string): boolean {
-    const firstLine = output.split(/\r?\n/, 1)[0]?.trim().toLowerCase() ?? '';
-    return (
-      firstLine.startsWith('[error]') &&
-      firstLine.includes('session') &&
-      (firstLine.includes('not found') || firstLine.includes('no session'))
-    );
-  }
-
-  function pendingCallId(input: {
-    callID?: string;
-    sessionID?: string;
-  }): string {
-    return (
-      input.callID ??
-      `${input.sessionID ?? 'unknown'}:anonymous-${++anonymousPendingCallId}`
-    );
-  }
-
-  function rememberPendingCall(call: PendingTaskCall): void {
-    const existingIndex = pendingCallOrder.indexOf(call.callId);
-    if (existingIndex >= 0) {
-      pendingCallOrder.splice(existingIndex, 1);
-    }
-
-    pendingCalls.set(call.callId, call);
-    pendingCallOrder.push(call.callId);
-
-    while (pendingCallOrder.length > MAX_PENDING_TASK_CALLS) {
-      const evictedCallId = pendingCallOrder.shift();
-      if (!evictedCallId) {
-        break;
-      }
-      pendingCalls.delete(evictedCallId);
-    }
-  }
-
-  function takePendingCall(
-    callId?: string,
-    parentSessionId?: string,
-  ): PendingTaskCall | undefined {
-    const resolvedCallId = callId ?? firstPendingCallForParent(parentSessionId);
-    if (!resolvedCallId) return undefined;
-
-    const pending = pendingCalls.get(resolvedCallId);
-    pendingCalls.delete(resolvedCallId);
-
-    const orderIndex = pendingCallOrder.indexOf(resolvedCallId);
-    if (orderIndex >= 0) {
-      pendingCallOrder.splice(orderIndex, 1);
-    }
-
-    return pending;
-  }
-
-  function firstPendingCallForParent(
-    parentSessionId?: string,
-  ): string | undefined {
-    if (!parentSessionId) return undefined;
-    return pendingCallOrder.find(
-      (callId) => pendingCalls.get(callId)?.parentSessionId === parentSessionId,
-    );
-  }
-
-  function rememberInjectedTerminalJobs(parentSessionID: string): void {
-    const taskIDs = backgroundJobBoard
-      .list(parentSessionID)
-      .filter((job) => job.terminalUnreconciled)
-      .map((job) => job.taskID);
-    if (taskIDs.length === 0) return;
-
-    log('[task-session-manager] terminal jobs injected for reconciliation', {
-      parentSessionID,
-      taskIDs,
-    });
-
-    const existing =
-      terminalJobsInjectedByParent.get(parentSessionID) ?? new Set<string>();
-    for (const taskID of taskIDs) {
-      existing.add(taskID);
-    }
-    terminalJobsInjectedByParent.set(parentSessionID, existing);
-  }
-
-  function reconcileInjectedTerminalJobs(parentSessionID: string): void {
-    const taskIDs = terminalJobsInjectedByParent.get(parentSessionID);
-    if (!taskIDs) return;
-
-    log('[task-session-manager] reconciling injected terminal jobs', {
-      parentSessionID,
-      taskIDs: [...taskIDs],
-    });
-
-    for (const taskID of taskIDs) {
-      backgroundJobBoard.markReconciled(taskID);
-    }
-    terminalJobsInjectedByParent.delete(parentSessionID);
-  }
+  const injectionState: InjectionState = {
+    backgroundJobBoard,
+    maxRetainedSnapshots: options.maxRetainedSnapshots,
+    strategy: options.strategy ?? 'latest',
+    lifecycleLedger: rehydrateState,
+    processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
+    processedInjectedCompletionOrder:
+      rehydrateState.processedInjectedCompletionOrder,
+    injectedCompletionFences: rehydrateState.injectedCompletionFences,
+    syntheticTerminalOccurrences: rehydrateState.syntheticTerminalOccurrences,
+    syntheticTerminalOccurrenceOrder:
+      rehydrateState.syntheticTerminalOccurrenceOrder,
+    getLifecycleEpoch: () => rehydrateState.nextEpoch,
+    getDeletionEpoch: (taskID) => rehydrateState.deletionEpochs.get(taskID),
+    terminalJobsInjectedByParent,
+    pendingInjectedTerminalJobsByParent,
+    metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
+    shouldManageSession: options.shouldManageSession,
+    taskContextTracker,
+    retainedBoardSnapshots: new Map(),
+    retainedTailBoards: new Map(),
+  };
 
   return {
-    'tool.execute.before': async (
+    markRevivedRunPending: (taskID: string): void => {
+      taskContextTracker.pendingManagedTaskIds.add(taskID);
+    },
+    clearRevivedRunPending: (taskID: string): void => {
+      taskContextTracker.pendingManagedTaskIds.delete(taskID);
+    },
+    contextFilesForTask: (taskID: string) =>
+      taskContextTracker.contextFilesForPrompt(taskID),
+    pruneTaskContext: (): void => {
+      taskContextTracker.prune(backgroundJobBoard);
+    },
+    beginUserWait: (sessionID: string): void => {
+      inputWaits.beginUserWait(sessionID);
+    },
+
+    /**
+     * Narrow exposure for the orchestrator-wake scheduler: true while a
+     * question/permission is open or wait_for_user is latched.
+     */
+    hasInputWait: (sessionID: string): boolean => hasInputWait(sessionID),
+
+    observeChatMessage: (input: unknown, output: unknown): void => {
+      const inputMessage = isObjectRecord(input) ? input : undefined;
+      const outputRecord = isObjectRecord(output) ? output : undefined;
+      const outputMessage = isObjectRecord(outputRecord?.message)
+        ? outputRecord.message
+        : undefined;
+      const sessionID =
+        typeof outputMessage?.sessionID === 'string'
+          ? outputMessage.sessionID
+          : typeof inputMessage?.sessionID === 'string'
+            ? inputMessage.sessionID
+            : undefined;
+      const parts = Array.isArray(outputRecord?.parts)
+        ? outputRecord.parts
+        : inputMessage?.parts;
+      // Safe identity order (Oracle): input.messageID → output.message.id →
+      // same-process output.message object → fail closed.
+      const messageIdentity: string | object | undefined =
+        typeof inputMessage?.messageID === 'string' &&
+        inputMessage.messageID.length > 0
+          ? inputMessage.messageID
+          : typeof outputMessage?.id === 'string' && outputMessage.id.length > 0
+            ? outputMessage.id
+            : outputMessage;
+      if (
+        !sessionID ||
+        messageIdentity === undefined ||
+        (typeof outputMessage?.role === 'string' &&
+          outputMessage.role !== 'user') ||
+        !options.shouldManageSession(sessionID) ||
+        !Array.isArray(parts) ||
+        parts.some(isInternalInitiatorPart) ||
+        !parts.some(
+          (part) =>
+            isObjectRecord(part) &&
+            part.synthetic !== true &&
+            !isInternalInitiatorPart(part) &&
+            ((part.type === 'text' && typeof part.text === 'string') ||
+              part.type === 'file' ||
+              part.type === 'image'),
+        )
+      ) {
+        return;
+      }
+      idleSessionTokens.onExternalUserMessage(sessionID, messageIdentity);
+    },
+
+    'tool.execute.before': (
       input: { tool: string; sessionID?: string; callID?: string },
       output: { args?: unknown },
-    ): Promise<void> => {
-      const toolName = input.tool.toLowerCase();
-      if (toolName !== 'task') return;
-      if (!input.sessionID || !options.shouldManageSession(input.sessionID)) {
-        return;
-      }
-      if (!isObjectRecord(output.args)) return;
-
-      const args = output.args as TaskArgs;
-      if (
-        typeof args.subagent_type !== 'string' ||
-        args.subagent_type.trim() === ''
-      ) {
-        if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
-          delete args.task_id;
-        }
-        return;
-      }
-
-      const agentType = args.subagent_type.trim();
-
-      const label = deriveTaskSessionLabel({
-        description:
-          typeof args.description === 'string' ? args.description : undefined,
-        prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
-        agentType,
-      });
-
-      const pendingCall: PendingTaskCall = {
-        callId: pendingCallId({
-          callID: input.callID,
-          sessionID: input.sessionID,
-        }),
-        parentSessionId: input.sessionID,
-        agentType,
-        label,
-      };
-      rememberPendingCall(pendingCall);
-
-      if (typeof args.task_id !== 'string' || args.task_id.trim() === '') {
-        return;
-      }
-
-      const requested = args.task_id.trim();
-      const remembered = backgroundJobBoard.resolveReusable(
-        input.sessionID,
-        requested,
-        agentType,
-      );
-
-      if (!remembered) {
-        if (RAW_SESSION_ID_PATTERN.test(requested)) {
-          pendingCall.resumedTaskId = requested;
-          rememberPendingCall(pendingCall);
-          return;
-        }
-        delete args.task_id;
-        return;
-      }
-
-      args.task_id = remembered.taskID;
-      pendingManagedTaskIds.add(remembered.taskID);
-      backgroundJobBoard.markUsed(input.sessionID, remembered.taskID);
-      pendingCall.resumedTaskId = remembered.taskID;
-      rememberPendingCall(pendingCall);
-    },
+    ): Promise<void> =>
+      handleToolExecuteBefore(input, output, {
+        shouldManageSession: options.shouldManageSession,
+        registerSessionAsOrchestrator: options.registerSessionAsOrchestrator,
+        backgroundJobBoard,
+        backgroundJobSupervisor: options.backgroundJobSupervisor,
+        pendingCallTracker,
+        taskContextTracker,
+        getLifecycleEpoch: () => rehydrateState.nextEpoch,
+      }),
 
     'tool.execute.after': async (
       input: { tool: string; sessionID?: string; callID?: string },
       output: { output: unknown; metadata?: unknown },
     ): Promise<void> => {
-      if (input.tool.toLowerCase() === 'read') {
-        if (input.sessionID && canTrackTaskContext(input.sessionID)) {
-          addTaskContext(
-            input.sessionID,
-            extractReadFiles(_ctx.directory, output),
-          );
-        }
-        return;
-      }
-
-      if (input.tool.toLowerCase() !== 'task') return;
-
-      const pending = takePendingCall(input.callID, input.sessionID);
-
-      if (!pending || typeof output.output !== 'string') return;
-      const launch = parseTaskLaunchOutput(output.output);
-      if (launch && !launch.result?.match(/Timed out after \d+ms/i)) {
-        const record = backgroundJobBoard.registerLaunch({
-          taskID: launch.taskID,
-          parentSessionID: pending.parentSessionId,
-          agent: pending.agentType,
-          description: pending.label,
-          objective: pending.label,
-        });
-        log('[task-session-manager] background task launch registered', {
-          taskID: record.taskID,
-          alias: record.alias,
-          parentSessionID: record.parentSessionID,
-          agent: record.agent,
-          description: record.description,
-          state: record.state,
-        });
-        backgroundJobBoard.addContext(
-          launch.taskID,
-          contextFilesForPrompt(contextByTask.get(launch.taskID)),
-        );
-        pendingManagedTaskIds.add(launch.taskID);
-        return;
-      }
-
-      normalizeLateCancelledTaskOutput(output);
-      const status = parseTaskStatusOutput(output.output);
-      if (status) {
-        const existing = backgroundJobBoard.get(status.taskID);
-        const record =
-          existing ??
-          backgroundJobBoard.registerLaunch({
-            taskID: status.taskID,
-            parentSessionID: pending.parentSessionId,
-            agent: pending.agentType,
-            description: pending.label,
-            objective: pending.label,
-          });
-        const updated = backgroundJobBoard.updateStatus({
-          taskID: status.taskID,
-          state: status.state,
-          timedOut: status.timedOut,
-          resultSummary: status.result,
-        });
-        log('[task-session-manager] foreground task status registered', {
-          taskID: status.taskID,
-          alias: updated?.alias ?? record.alias,
-          parentSessionID: pending.parentSessionId,
-          agent: pending.agentType,
-          state: updated?.state ?? record.state,
-        });
-        if (pending.resumedTaskId && pending.resumedTaskId !== status.taskID) {
-          backgroundJobBoard.drop(pending.resumedTaskId);
-        }
-        pendingManagedTaskIds.delete(status.taskID);
-        const contextFiles = contextFilesForPrompt(
-          contextByTask.get(status.taskID),
-        );
-        backgroundJobBoard.addContext(status.taskID, contextFiles);
-        pruneContext();
-        return;
-      }
-
-      const taskId = parseTaskIdFromTaskOutput(output.output);
-      if (!taskId) {
-        if (
-          pending.resumedTaskId &&
-          isMissingRememberedSessionError(output.output)
-        ) {
-          backgroundJobBoard.drop(pending.resumedTaskId);
-        }
-        return;
-      }
-
-      if (pending.resumedTaskId && pending.resumedTaskId !== taskId) {
-        backgroundJobBoard.drop(pending.resumedTaskId);
-      }
-
-      pendingManagedTaskIds.delete(taskId);
-      const contextFiles = contextFilesForPrompt(contextByTask.get(taskId));
-      backgroundJobBoard.addContext(taskId, contextFiles);
-      pruneContext();
+      await handleToolExecuteAfter(input, output, {
+        directory: _ctx.directory,
+        backgroundJobBoard,
+        backgroundJobSupervisor: options.backgroundJobSupervisor,
+        recordLifecycleSuppression: (taskID) =>
+          recordBackgroundJobSuppression(backgroundJobBoard, taskID),
+        pendingCallTracker,
+        taskContextTracker,
+        clearRehydrateTombstone: (taskID) => {
+          clearBackgroundJobSuppression(backgroundJobBoard, taskID);
+        },
+        isStaleDeletedTaskOutput: (taskID, lifecycleEpoch) => {
+          const deletionEpoch = rehydrateState.deletionEpochs.get(taskID);
+          return deletionEpoch !== undefined && lifecycleEpoch < deletionEpoch;
+        },
+      });
+      runtimeStatusReconciler.schedule();
     },
 
     'experimental.chat.messages.transform': async (
@@ -646,6 +436,19 @@ export function createTaskSessionManagerHook(
       output: { messages?: unknown },
     ): Promise<void> => {
       const messages = Array.isArray(output.messages) ? output.messages : [];
+
+      // Keep still-running task tool results byte-stable so a live background
+      // lane never rewrites mid-history bytes and invalidates the prompt
+      // cache. Terminal results are left untouched (they materialize once).
+      stabilizeRunningTaskParts(messages);
+
+      const rehydratedCount = rehydrateHistoricalRunningTasks(
+        messages,
+        backgroundJobBoard,
+        options.shouldManageSession,
+        options.registerSessionAsOrchestrator,
+        rehydrateTombstones,
+      );
 
       for (const [messageIndex, message] of messages.entries()) {
         if (!isUserMessageWithParts(message)) continue;
@@ -656,241 +459,83 @@ export function createTaskSessionManagerHook(
           !message.info.sessionID ||
           !options.shouldManageSession(message.info.sessionID)
         ) {
-          continue;
+          const sessionID = message.info.sessionID;
+          if (!sessionID || message.info.agent !== 'orchestrator') {
+            continue;
+          }
+          options.registerSessionAsOrchestrator?.(sessionID);
+          if (!options.shouldManageSession(sessionID)) continue;
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
-          updateFromInjectedCompletion(part, message, messageIndex, partIndex);
+          updateFromInjectedCompletion(
+            injectionState,
+            part,
+            message,
+            messageIndex,
+            partIndex,
+          );
         }
       }
 
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const message = messages[i];
-        if (!isUserMessageWithParts(message)) continue;
-        if (message.info.agent && message.info.agent !== 'orchestrator') return;
-        if (
-          !message.info.sessionID ||
-          !options.shouldManageSession(message.info.sessionID)
-        ) {
-          return;
-        }
-
-        const reminders = [
-          backgroundJobBoard.formatForPrompt(message.info.sessionID),
-        ].filter((item): item is string => Boolean(item));
-        if (reminders.length === 0) return;
-
-        const textPart = message.parts.find(
-          (part) => part.type === 'text' && typeof part.text === 'string',
-        );
-        if (!textPart) return;
-        if (textPart.text?.includes(SLIM_INTERNAL_INITIATOR_MARKER)) return;
-        if (textPart.text?.includes(BACKGROUND_JOB_BOARD_SENTINEL)) return;
-
-        rememberInjectedTerminalJobs(message.info.sessionID);
-        textPart.text = [textPart.text ?? '', '', reminders.join('\n\n')].join(
-          '\n',
-        );
-        return;
+      if (rehydratedCount > 0) {
+        await runtimeStatusReconciler.reconcile();
       }
     },
 
-    event: async (input: {
+    injectBackgroundJobBoard: (
+      input: Record<string, never>,
+      output: { messages?: unknown },
+    ) => injectBackgroundJobBoard(injectionState, input, output),
+
+    event: (input: {
       event: {
         type: string;
         properties?: {
-          info?: { id?: string; parentID?: string };
+          info?: { id?: string; parentID?: string; agent?: string };
+          id?: string;
+          requestID?: string;
           sessionID?: string;
           status?: { type?: string };
           error?: { name?: string };
+          part?: unknown;
         };
       };
     }): Promise<void> => {
-      if (input.event.type === 'session.created') {
-        const info = input.event.properties?.info;
-        log('[task-session-manager] session.created observed', {
-          sessionID: info?.id,
-          parentSessionID: info?.parentID,
-          managesParent: info?.parentID
-            ? options.shouldManageSession(info.parentID)
-            : false,
-        });
-        if (
-          info?.id &&
-          info.parentID &&
-          options.shouldManageSession(info.parentID)
-        ) {
-          pendingManagedTaskIds.add(info.id);
-        }
-        return;
-      }
-
-      if (
-        input.event.type === 'session.idle' ||
-        (input.event.type === 'session.status' &&
-          (input.event.properties as { status?: { type?: string } } | undefined)
-            ?.status?.type === 'idle')
-      ) {
-        const sessionId =
+      if (input.event.type === 'session.deleted') {
+        const sessionID =
           input.event.properties?.info?.id ?? input.event.properties?.sessionID;
-        log('[task-session-manager] idle/status idle observed', {
-          sessionID: sessionId,
-          managesSession: sessionId
-            ? options.shouldManageSession(sessionId)
-            : false,
-          terminalJobsPending: sessionId
-            ? (terminalJobsInjectedByParent.get(sessionId)?.size ?? 0)
-            : 0,
-        });
-        if (sessionId && options.shouldManageSession(sessionId)) {
-          reconcileInjectedTerminalJobs(sessionId);
-        }
-        return;
-      }
-
-      if (input.event.type === 'session.error') {
-        const sessionId =
-          input.event.properties?.info?.id ?? input.event.properties?.sessionID;
-        if (sessionId && options.shouldManageSession(sessionId)) {
-          // Only clear injected terminal jobs for fatal errors.
-          // Rate-limit errors are recovered by ForegroundFallbackManager
-          // (abort + reprompt with fallback model); clearing the injected
-          // job state here would make the orchestrator lose track of
-          // completed background tasks and unable to dispatch follow-ups.
-          const props = input.event.properties as
-            | { error?: unknown }
-            | undefined;
-          if (!props?.error || !isRateLimitError(props.error)) {
-            terminalJobsInjectedByParent.delete(sessionId);
+        if (sessionID) {
+          deferredInlineErrors.delete(sessionID);
+          if (!options.isFallbackInProgress?.(sessionID)) {
+            const hardTimedOut =
+              backgroundJobBoard.field(sessionID, 'deadlineExceededAt') !==
+              undefined;
+            if (!hardTimedOut) rememberDeletedSession(sessionID);
           }
         }
-
-        return;
       }
 
-      if (
-        input.event.type === 'session.status' &&
-        (input.event.properties as { status?: { type?: string } } | undefined)
-          ?.status?.type === 'busy'
-      ) {
-        const sessionId =
-          input.event.properties?.info?.id ?? input.event.properties?.sessionID;
-        const before = sessionId
-          ? backgroundJobBoard.get(sessionId)
-          : undefined;
-        const updated = sessionId
-          ? backgroundJobBoard.markRunningFromLiveSession(sessionId)
-          : undefined;
-        if (before?.cancellationRequested) {
-          log('[task-session-manager] busy observed after cancel request', {
-            sessionID: sessionId,
-            previousState: before.state,
-            previousTerminalState: before.terminalState,
-            terminalUnreconciled: before.terminalUnreconciled,
-            resultSummary: before.resultSummary,
-            updatedState: updated?.state,
-            updatedCancellationRequested: updated?.cancellationRequested,
-          });
-        }
-        log('[task-session-manager] busy/status busy observed', {
-          sessionID: sessionId,
-          managesSession: sessionId
-            ? options.shouldManageSession(sessionId)
-            : false,
-          previousState: before?.state,
-          previousTerminalState: before?.terminalState,
-          previousCancellationRequested: before?.cancellationRequested,
-          previousLastLiveBusyAt: before?.lastLiveBusyAt,
-          updatedState: updated?.state,
-          updatedCancellationRequested: updated?.cancellationRequested,
-          updatedLastLiveBusyAt: updated?.lastLiveBusyAt,
-        });
-        return;
+      if (input.event.type === 'server.instance.disposed') {
+        runtimeStatusReconciler.dispose();
       }
-
-      if (input.event.type !== 'session.deleted') return;
-      const sessionId =
-        input.event.properties?.info?.id ?? input.event.properties?.sessionID;
-      if (!sessionId) return;
-
-      log(
-        '[task-session-manager] session.deleted observed; clearing job state',
-        {
-          sessionID: sessionId,
-          deletedJob: backgroundJobBoard.get(sessionId)
-            ? {
-                state: backgroundJobBoard.get(sessionId)?.state,
-                parentSessionID:
-                  backgroundJobBoard.get(sessionId)?.parentSessionID,
-                alias: backgroundJobBoard.get(sessionId)?.alias,
-              }
-            : undefined,
-          childJobCount: backgroundJobBoard.list(sessionId).length,
-          managesSession: options.shouldManageSession(sessionId),
-        },
-      );
-
-      backgroundJobBoard.drop(sessionId);
-      backgroundJobBoard.clearParent(sessionId);
-      terminalJobsInjectedByParent.delete(sessionId);
-      contextByTask.delete(sessionId);
-      pendingManagedTaskIds.delete(sessionId);
-      pruneContext();
-
-      for (const [callId, pending] of pendingCalls.entries()) {
-        if (pending.parentSessionId !== sessionId) {
-          continue;
-        }
-        takePendingCall(callId);
-      }
+      return handleEvent(input, {
+        inputWaits,
+        idleSessionTokens,
+        options,
+        idleReconciler,
+        deferredInlineErrors,
+        backgroundJobBoard,
+        pendingCallTracker,
+        taskContextTracker,
+        terminalJobsInjectedByParent,
+        pendingInjectedTerminalJobsByParent,
+        retainedBoardSnapshots: injectionState.retainedBoardSnapshots,
+        backgroundJobSupervisor: options.backgroundJobSupervisor,
+        observeSyntheticTerminalPart: (part) =>
+          observeSyntheticTerminalPart(injectionState, part),
+        revivedRunTracker: options.revivedRunTracker,
+      }).then(() => runtimeStatusReconciler.schedule());
     },
   };
-
-  function normalizeLateCancelledTaskOutput(output: {
-    output: unknown;
-    metadata?: unknown;
-  }): void {
-    if (typeof output.output !== 'string') return;
-    const status = parseTaskStatusOutput(output.output);
-    if (!status) return;
-    const existing = backgroundJobBoard.get(status.taskID);
-    if (!isLateCancelledTaskError(existing, status.state)) return;
-    log('[task-session-manager] normalized late cancelled task output', {
-      taskID: status.taskID,
-      alias: existing?.alias,
-      state: existing?.state,
-      terminalState: existing?.terminalState,
-      result: status.result,
-    });
-    output.output = formatCancelledTaskStatusOutput(
-      status.taskID,
-      existing?.resultSummary,
-    );
-    if (isObjectRecord(output) && isObjectRecord(output.metadata)) {
-      output.metadata.state = 'cancelled';
-    }
-  }
-}
-
-function isLateCancelledTaskError(
-  job: BackgroundJobRecord | undefined,
-  state: string,
-): boolean {
-  if (state !== 'error') return false;
-  if (!job?.cancellationRequested) return false;
-  return job.state === 'cancelled' || job.terminalState === 'cancelled';
-}
-
-function formatCancelledTaskStatusOutput(
-  taskID: string,
-  summary = 'cancelled',
-): string {
-  return [
-    `task_id: ${taskID}`,
-    'state: cancelled',
-    '',
-    '<task_error>',
-    summary,
-    '</task_error>',
-  ].join('\n');
 }

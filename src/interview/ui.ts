@@ -1,3 +1,4 @@
+import { escapeHtml } from '../utils/escape-html';
 import type { InterviewFileItem, InterviewListItem } from './types';
 
 interface DashboardInterviewItem extends InterviewListItem {
@@ -10,15 +11,6 @@ interface DashboardInterviewItem extends InterviewListItem {
 
 const BRAND_LOGO_URL =
   'https://ohmyopencodeslim.com/android-chrome-512x512.png';
-
-export function escapeHtml(value: string): string {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
 
 // ─── Shared client-side helpers ────────────────────────────────────
 
@@ -375,8 +367,8 @@ export function renderDashboardPage(
         <p class="muted">${totalCount} item${totalCount === 1 ? '' : 's'}</p>
       </div>
       <div class="info-box">
-        <strong>Interviews</strong> — live sessions and recovered files. State is pushed from OpenCode sessions to this dashboard.<br>
-        <strong>Files without session</strong> — <code>.md</code> files in <code>${escapeHtml(outputFolder)}</code> with no frontmatter. Resume with <code>/interview &lt;name&gt;</code>.
+        <strong>Interviews</strong> - live sessions and recovered files. State is pushed from OpenCode sessions to this dashboard.<br>
+        <strong>Files without session</strong> - <code>.md</code> files in <code>${escapeHtml(outputFolder)}</code> with no frontmatter. Resume with <code>/interview &lt;name&gt;</code>.
       </div>
       <details style="margin-bottom:24px">
         <summary style="cursor:pointer;font-size:13px;color:rgba(255,255,255,0.4);user-select:none">Settings</summary>
@@ -404,7 +396,7 @@ export function renderDashboardPage(
       ${fileSection}
       <div class="footer">OH MY OPENCODE SLIM</div>
     </div>
-    <div class="update-banner" id="updateBanner">Dashboard updated — tap to refresh</div>
+    <div class="update-banner" id="updateBanner">Dashboard updated - tap to refresh</div>
     <script>
       ${clipboardHelperJs()}
       document.querySelectorAll('.copy-btn').forEach(btn => {
@@ -579,7 +571,7 @@ export function renderInterviewPage(
       h3 { font-size: 18px; font-weight: 500; margin-bottom: 16px; line-height: 1.4; }
       p { margin-top: 0; }
       .meta { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: rgba(255,255,255,0.4); margin-bottom: 16px; letter-spacing: 0.05em; text-transform: uppercase; }
-      
+
        .file-path-container {
          font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
          font-size: 13px;
@@ -613,18 +605,18 @@ export function renderInterviewPage(
        }
 
        .question {
-        background: rgba(255,255,255,0.02); 
-        border: 1px solid rgba(255,255,255,0.1); 
+        background: rgba(255,255,255,0.02);
+        border: 1px solid rgba(255,255,255,0.1);
         border-left: 1px solid rgba(255,255,255,0.1);
-        border-radius: 6px; 
-        padding: 28px; 
-        margin-bottom: 32px; 
+        border-radius: 6px;
+        padding: 28px;
+        margin-bottom: 32px;
         transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
       }
       .question:focus-within {
         border-color: rgba(255,255,255,0.3);
       }
-      
+
       /* Make active question much clearer */
       .question.active-question {
         background: rgba(255,255,255,0.04);
@@ -633,7 +625,7 @@ export function renderInterviewPage(
         box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.1);
         transform: translateX(4px);
       }
-      
+
       .options { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
       .question-hint {
         display: flex;
@@ -666,14 +658,14 @@ export function renderInterviewPage(
         border: 1px solid rgba(255,255,255,0.08);
         color: rgba(255,255,255,0.95);
       }
-      
-      .option { 
-        border: 1px solid rgba(255,255,255,0.1); 
-        background: transparent; 
-        color: inherit; 
-        border-radius: 6px; 
-        padding: 14px 18px; 
-        cursor: pointer; 
+
+      .option {
+        border: 1px solid rgba(255,255,255,0.1);
+        background: transparent;
+        color: inherit;
+        border-radius: 6px;
+        padding: 14px 18px;
+        cursor: pointer;
         text-align: left;
         font-size: 16px;
         transition: all 0.2s ease;
@@ -684,13 +676,13 @@ export function renderInterviewPage(
         background: rgba(255,255,255,0.06);
         border-color: rgba(255,255,255,0.3);
       }
-      .option.selected { 
-        background: #ffffff; 
-        color: #000000; 
-        border-color: #ffffff; 
+      .option.selected {
+        background: #ffffff;
+        color: #000000;
+        border-color: #ffffff;
         font-weight: 500;
       }
-      
+
       .shortcut {
         display: inline-flex;
         align-items: center;
@@ -709,7 +701,7 @@ export function renderInterviewPage(
         background: rgba(0,0,0,0.15);
         color: rgba(0,0,0,0.9);
       }
-       
+
       .option-text {
         flex: 1;
         line-height: 1.4;
@@ -741,16 +733,16 @@ export function renderInterviewPage(
         font-size: 12px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
-      
-      textarea { 
-        width: 100%; 
+
+      textarea {
+        width: 100%;
         box-sizing: border-box;
-        min-height: 140px; 
-        border-radius: 6px; 
-        border: 1px solid rgba(255,255,255,0.15); 
-        background: rgba(0,0,0,0.6); 
-        color: inherit; 
-        padding: 16px; 
+        min-height: 140px;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(0,0,0,0.6);
+        color: inherit;
+        padding: 16px;
         font-family: inherit;
         font-size: 16px;
         line-height: 1.5;
@@ -766,16 +758,16 @@ export function renderInterviewPage(
       .hidden-textarea {
         display: none;
       }
-      
-      button.primary { 
-        background: #ffffff; 
-        color: #000000; 
-        border: 0; 
-        border-radius: 6px; 
-        padding: 16px 24px; 
+
+      button.primary {
+        background: #ffffff;
+        color: #000000;
+        border: 0;
+        border-radius: 6px;
+        padding: 16px 24px;
         font-size: 16px;
         font-weight: 600;
-        cursor: pointer; 
+        cursor: pointer;
         width: 100%;
         transition: opacity 0.2s ease, transform 0.1s ease;
       }
@@ -786,11 +778,11 @@ export function renderInterviewPage(
       button.primary:active:not(:disabled) {
         transform: translateY(1px);
       }
-      button.primary:disabled { 
-        opacity: 0.3; 
-        cursor: not-allowed; 
+      button.primary:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
       }
-      
+
       .footer {
         margin-top: 32px;
         text-align: center;
@@ -831,7 +823,7 @@ export function renderInterviewPage(
         opacity: 1;
         pointer-events: all;
       }
-      
+
       .loading-overlay .status-text {
         font-size: 15px;
         letter-spacing: 0.1em;
@@ -1042,12 +1034,12 @@ export function renderInterviewPage(
       </div>
       <h1 id="idea">Connecting...</h1>
       <p class="muted" id="summary">Preparing interview session</p>
-      
+
       <div class="meta">
         <span id="status">INITIALIZING</span>
         <span>OH MY OPENCODE SLIM</span>
       </div>
-      
+
       <div id="filePathContainer" class="file-path-container" style="display: none;">
         <span class="file-path-icon">📄</span>
         <span id="markdownPath"></span>
@@ -1065,18 +1057,18 @@ export function renderInterviewPage(
         <button class="nudge-btn" id="moreQuestionsBtn" type="button">Ask more questions</button>
         <button class="nudge-btn nudge-confirm" id="confirmCompleteBtn" type="button">Confirm complete ✓</button>
       </div>
-      
+
        <button class="primary" id="submitButton" disabled>Submit Answers <span class="submit-shortcut">⌘↵</span></button>
-      
+
       <div class="footer" id="submitStatus"></div>
     </div>
-    
+
     <div class="loading-overlay" id="loadingOverlay">
       <div class="status-text" id="loadingText">Processing...</div>
     </div>
 
     <div class="chat-panel" id="chatPanel">
-      <input type="text" id="chatInput" class="chat-input" placeholder="Send a message to the agent — add a section, revise content, ask questions..." autocomplete="off" />
+      <input type="text" id="chatInput" class="chat-input" placeholder="Send a message to the agent - add a section, revise content, ask questions..." autocomplete="off" />
       <button class="chat-send" id="chatSendBtn" type="button" disabled>Send</button>
     </div>
 
@@ -1112,7 +1104,7 @@ export function renderInterviewPage(
           !allAnswered;
         const hideSubmit = ['completed', 'session-disconnected'];
         button.style.display = hideSubmit.includes(state.data.mode) ? 'none' : '';
-        
+
         const overlay = document.getElementById('loadingOverlay');
         const overlayText = document.getElementById('loadingText');
         if (state.data.isBusy) {
@@ -1132,7 +1124,7 @@ export function renderInterviewPage(
         button.type = 'button';
         button.className = 'option';
         button.id = getOptionButtonId(question.id, index);
-        
+
         const shortcut = index < 9 ? (index + 1) : '';
         if (shortcut) {
           const kbd = document.createElement('span');
@@ -1140,7 +1132,7 @@ export function renderInterviewPage(
           kbd.textContent = shortcut;
           button.appendChild(kbd);
         }
-        
+
         const text = document.createElement('span');
         text.className = 'option-text';
         text.textContent = isCustom ? 'Custom' : option;
@@ -1163,13 +1155,13 @@ export function renderInterviewPage(
           }
           handleOptionSelect(question, option, isCustom);
         });
-        
+
         return button;
       }
 
       function handleOptionSelect(question, option, isCustom) {
         const textarea = document.getElementById('answer-' + question.id);
-        
+
         if (isCustom) {
           state.customMode[question.id] = true;
           state.answers[question.id] = state.customMode[question.id]
@@ -1186,7 +1178,7 @@ export function renderInterviewPage(
           updateTextareaVisibility(question.id);
           advanceToNextQuestion(question.id);
         }
-        
+
         updateSubmitButton();
         updateOptionsDOM(question.id);
       }
@@ -1204,7 +1196,7 @@ export function renderInterviewPage(
       function advanceToNextQuestion(currentQuestionId) {
         const questions = state.data?.questions || [];
         const currentIndex = questions.findIndex(q => q.id === currentQuestionId);
-        
+
         if (currentIndex >= 0 && currentIndex < questions.length - 1) {
           state.activeQuestionIndex = currentIndex + 1;
           updateActiveQuestionFocus();
@@ -1224,10 +1216,10 @@ export function renderInterviewPage(
       function updateOptionsDOM(questionId) {
         const question = (state.data?.questions || []).find(q => q.id === questionId);
         if (!question) return;
-        
+
         const predefined = question.options || [];
         const currentAnswer = state.answers[question.id];
-        
+
         predefined.forEach((opt, idx) => {
            const btn = document.getElementById(getOptionButtonId(questionId, idx));
            if (btn) {
@@ -1235,7 +1227,7 @@ export function renderInterviewPage(
               else btn.classList.remove('selected');
            }
         });
-        
+
         const customBtn = document.getElementById(getOptionButtonId(questionId, predefined.length));
         if (customBtn) {
            if (state.customMode[questionId]) {
@@ -1360,12 +1352,12 @@ export function renderInterviewPage(
          if (num >= 1 && num <= 9) {
           const activeQ = questions[state.activeQuestionIndex];
           if (!activeQ) return;
-          
+
           const options = activeQ.options || [];
           if (!options.length) return;
 
           const idx = num - 1;
-          
+
           if (idx < options.length) {
             handleOptionSelect(activeQ, options[idx], false);
             e.preventDefault();
@@ -1375,7 +1367,7 @@ export function renderInterviewPage(
          }
 
         }
-        
+
         if (e.key === 'ArrowDown') {
            if (state.activeQuestionIndex < questions.length - 1) {
               state.activeQuestionIndex++;
@@ -1435,7 +1427,7 @@ export function renderInterviewPage(
 
       // simpleMarkdown: safe because escaping happens BEFORE markdown
       // processing. Adding raw HTML output from user content would break
-      // this safety — always use textContent for user data.
+      // this safety - always use textContent for user data.
       function simpleMarkdown(text) {
         if (!text) return '';
         const escaped = text
@@ -1454,7 +1446,7 @@ export function renderInterviewPage(
         button.disabled = true;
         const submitStatus = document.getElementById('submitStatus');
         submitStatus.textContent = '';
-        
+
         try {
           const res = await fetch('/api/interviews/' + encodeURIComponent(interviewId) + '/block-comment', {
             method: 'POST',
@@ -1581,7 +1573,7 @@ export function renderInterviewPage(
             aBadge.textContent = 'A';
             const aText = document.createElement('span');
             aText.className = 'qa-text qa-text-a';
-            aText.textContent = pair.a || '—';
+            aText.textContent = pair.a || '-';
             aRow.appendChild(aBadge);
             aRow.appendChild(aText);
             card.appendChild(aRow);
@@ -1649,7 +1641,7 @@ export function renderInterviewPage(
         if (busy) {
           input.placeholder = 'Agent is processing...';
         } else {
-          input.placeholder = 'Send a message to the agent — add a section, revise content, ask questions...';
+          input.placeholder = 'Send a message to the agent - add a section, revise content, ask questions...';
         }
       }
 
@@ -1704,7 +1696,7 @@ export function renderInterviewPage(
           updateActiveQuestionFocus();
           return;
         }
-        
+
         state.lastSig = sig;
         container.replaceChildren();
 
@@ -1727,7 +1719,7 @@ export function renderInterviewPage(
           const wrapper = document.createElement('div');
           wrapper.className = 'question';
           wrapper.id = 'question-' + question.id;
-          
+
            if (question.suggested && !state.answers[question.id]) {
              state.answers[question.id] = question.suggested;
              state.customMode[question.id] = false;
@@ -1764,12 +1756,12 @@ export function renderInterviewPage(
            if (!state.customMode[question.id]) {
              textarea.classList.add('hidden-textarea');
            }
-           
+
            textarea.addEventListener('focus', () => {
               state.activeQuestionIndex = idx;
             updateActiveQuestionFocus();
           });
-          
+
           textarea.addEventListener('input', () => {
             state.answers[question.id] = textarea.value;
             updateSubmitButton();
@@ -1779,7 +1771,7 @@ export function renderInterviewPage(
 
           container.appendChild(wrapper);
         });
-        
+
         updateActiveQuestionFocus();
         questions.forEach(q => updateOptionsDOM(q.id));
         const currentActiveQuestionId = questions[state.activeQuestionIndex]?.id;
@@ -1806,8 +1798,8 @@ export function renderInterviewPage(
         const statusEl = document.getElementById('status');
         statusEl.textContent = data.mode.toUpperCase();
         statusEl.className = isDone ? 'status-completed' : '';
-        
-        // Render Markdown Path — always visible in completed mode
+
+        // Render Markdown Path - always visible in completed mode
         const pathContainer = document.getElementById('filePathContainer');
         const pathElement = document.getElementById('markdownPath');
         const mdPath = data.markdownPath || (data.interview && data.interview.markdownPath);
@@ -1825,7 +1817,7 @@ export function renderInterviewPage(
           pathContainer.style.display = 'none';
         }
 
-        // Resume command — only in session-disconnected mode
+        // Resume command - only in session-disconnected mode
         var resumeRow = document.getElementById('resumeRow');
         if (resumeRow) {
           var showResume = data.mode === 'session-disconnected';
@@ -1835,7 +1827,7 @@ export function renderInterviewPage(
           }
         }
 
-        // Nudge actions — only for completed (live session)
+        // Nudge actions - only for completed (live session)
         // session-disconnected can't nudge (no session to receive it)
         const nudgeActions = document.getElementById('nudgeActions');
         const moreBtn = document.getElementById('moreQuestionsBtn');
@@ -1844,7 +1836,7 @@ export function renderInterviewPage(
         if (nudgeActions) nudgeActions.style.display = canNudge ? 'flex' : 'none';
         if (moreBtn) moreBtn.disabled = data.isBusy;
         if (confirmBtn) confirmBtn.disabled = data.isBusy;
-        
+
         renderQuestions(data.questions || []);
         updateSubmitButton();
         updateTocSidebar(data);
@@ -1958,7 +1950,7 @@ export function renderInterviewPage(
             if (confirmBtn) confirmBtn.disabled = false;
           } else {
             try { await refresh(); } catch (_) {}
-            schedulePoll(); // Restart polling — nudge may reactivate interview
+            schedulePoll(); // Restart polling - nudge may reactivate interview
           }
         } catch (_err) {
           document.getElementById('submitStatus').textContent = 'Network error.';

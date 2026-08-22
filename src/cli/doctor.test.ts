@@ -105,6 +105,84 @@ describe('runDoctorCheck', () => {
     expect(result.configs[1].path).toContain('.jsonc');
   });
 
+  test('string disabled_agents normalizes instead of failing schema validation', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_agents: 'explorer',
+        agents: { oracle: { model: 'test/model' } },
+      }),
+    );
+
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = runDoctorCheck(projectDir);
+
+      // The string is normalized (matching the loader), so the config is
+      // valid rather than a false invalid-schema diagnosis
+      expect(result.ok).toBe(true);
+      expect(result.configs[1].ok).toBe(true);
+      expect(result.configs[1].error).toBeUndefined();
+      expect(result.configs[1].config?.disabled_agents).toEqual(['explorer']);
+      expect(result.configs[1].config?.agents?.oracle?.model).toBe(
+        'test/model',
+      );
+
+      // The normalization is reported to the user
+      const calls = warnSpy.mock.calls as string[][];
+      const message = calls.find((call) =>
+        (call[0] as string).includes('disabled_agents'),
+      )?.[0];
+      expect(message).toContain('should be an array; normalized');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test('array disabled_tools config passes unchanged', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_tools: ['webfetch'],
+        agents: { oracle: { model: 'test/model' } },
+      }),
+    );
+
+    const result = runDoctorCheck(projectDir);
+
+    expect(result.ok).toBe(true);
+    expect(result.configs[1].ok).toBe(true);
+    expect(result.configs[1].error).toBeUndefined();
+    expect(result.configs[1].config?.disabled_tools).toEqual(['webfetch']);
+  });
+
+  test('config with UTF-8 BOM is accepted as valid', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      `\uFEFF${JSON.stringify({
+        agents: { oracle: { model: 'test/model' } },
+      })}`,
+    );
+
+    const result = runDoctorCheck(projectDir);
+
+    // The BOM is stripped before parsing, so the config is valid rather
+    // than a false invalid-json diagnosis
+    expect(result.ok).toBe(true);
+    expect(result.configs[1].ok).toBe(true);
+    expect(result.configs[1].error).toBeUndefined();
+    expect(result.configs[1].config?.agents?.oracle?.model).toBe('test/model');
+  });
+
   test('invalid JSON returns not ok with invalid-json error', () => {
     const projectDir = path.join(tempDir, 'project');
     const configDir = path.join(projectDir, '.opencode');

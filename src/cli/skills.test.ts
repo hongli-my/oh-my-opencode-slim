@@ -24,8 +24,8 @@ describe('skills permissions', () => {
     const orchestratorPerms = getSkillPermissionsForAgent('orchestrator');
     expect(orchestratorPerms.clonedeps).toBe('allow');
     expect(orchestratorPerms.deepwork).toBe('allow');
+    expect(orchestratorPerms['verification-planning']).toBe('allow');
     expect(orchestratorPerms.reflect).toBe('allow');
-    expect(orchestratorPerms['release-smoke-test']).toBe('allow');
     expect(orchestratorPerms.worktrees).toBe('allow');
     expect(orchestratorPerms['oh-my-opencode-slim']).toBe('allow');
   });
@@ -49,5 +49,41 @@ describe('skills permissions', () => {
   it('should honor wildcard in explicit list', () => {
     const wildcardPerms = getSkillPermissionsForAgent('designer', ['*']);
     expect(wildcardPerms['*']).toBe('allow');
+  });
+});
+
+describe('getSkillPermissionsForAgent with malformed disabledSkillNames', () => {
+  it('does not throw when disabledSkillNames is not an array', () => {
+    expect(() =>
+      getSkillPermissionsForAgent(
+        'orchestrator',
+        undefined,
+        'not-an-array' as any,
+      ),
+    ).not.toThrow();
+  });
+
+  it('treats non-array disabledSkillNames as empty array', () => {
+    const permsWithDisabled = getSkillPermissionsForAgent(
+      'orchestrator',
+      undefined,
+      ['simplify'],
+    );
+    const permsWithMalformed = getSkillPermissionsForAgent(
+      'orchestrator',
+      undefined,
+      'not-an-array' as any,
+    );
+    // When simplify is disabled, it should be explicitly denied
+    expect(permsWithDisabled.simplify).toBe('deny');
+    // When disabledSkillNames is malformed (treated as empty), simplify should be allowed
+    expect(permsWithMalformed['*']).toBe('allow');
+  });
+
+  it('handles object as disabledSkillNames gracefully', () => {
+    const perms = getSkillPermissionsForAgent('orchestrator', undefined, {
+      invalid: 'object',
+    } as any);
+    expect(perms['*']).toBe('allow');
   });
 });

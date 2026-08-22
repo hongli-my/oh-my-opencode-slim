@@ -17,12 +17,11 @@ describe('parseList', () => {
   test('orchestrator wildcard excludes context7 but includes custom mcps', () => {
     expect(
       parseList(DEFAULT_AGENT_MCPS.orchestrator, [
-        'websearch',
         'context7',
         'gh_grep',
         'custom-mcp',
       ]),
-    ).toEqual(['websearch', 'gh_grep', 'custom-mcp']);
+    ).toEqual(['gh_grep', 'custom-mcp']);
   });
 
   test('wildcard with exclusions', () => {

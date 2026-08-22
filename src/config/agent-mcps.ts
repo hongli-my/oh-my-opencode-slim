@@ -1,4 +1,5 @@
-import { type AgentName, getAgentOverride, type PluginConfig } from '.';
+import { AGENT_ALIASES, type AgentName } from './constants';
+import type { RuntimeConfig } from './runtime';
 
 /** Default MCPs per agent - "*" means all MCPs, "!item" excludes specific MCPs */
 
@@ -6,7 +7,7 @@ export const DEFAULT_AGENT_MCPS: Record<AgentName, string[]> = {
   orchestrator: ['*', '!context7'],
   designer: [],
   oracle: [],
-  librarian: ['websearch', 'context7', 'gh_grep'],
+  librarian: ['context7', 'gh_grep'],
   explorer: [],
   fixer: [],
   observer: [],
@@ -40,12 +41,20 @@ export function parseList(items: string[], allAvailable: string[]): string[] {
 
 /**
  * Get the MCP list for an agent (from config or defaults).
+ * Reads the merged (preset-aware) plugin-layer agents via RuntimeConfig.
  */
 export function getAgentMcpList(
   agentName: string,
-  config?: PluginConfig,
+  runtime: RuntimeConfig,
 ): string[] {
-  const agentConfig = getAgentOverride(config, agentName);
+  const agents = runtime.agents();
+  const agentConfig =
+    agents[agentName] ??
+    agents[
+      Object.keys(AGENT_ALIASES).find(
+        (key) => AGENT_ALIASES[key] === agentName,
+      ) ?? ''
+    ];
   if (agentConfig?.mcps !== undefined) {
     return agentConfig.mcps;
   }

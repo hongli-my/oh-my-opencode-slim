@@ -5,7 +5,13 @@
 import type { MultiplexerLayout } from '../../config/schema';
 import { crossSpawn } from '../../utils/compat';
 import { log } from '../../utils/logger';
-import type { Multiplexer, PaneResult } from '../types';
+import {
+  buildOpencodeAttachCommand,
+  findBinary,
+  gracefulClosePane,
+} from '../shared';
+import { readTmuxPane } from '../tmux-pane-registry';
+import type { Multiplexer, PaneResult, PaneSpawnOptions } from '../types';
 
 const TMUX_LAYOUT_DEBOUNCE_MS = 150;
 
@@ -17,8 +23,8 @@ export class TmuxMultiplexer implements Multiplexer {
   private storedLayout: MultiplexerLayout;
   private storedMainPaneSize: number;
   private targetPane = process.env.TMUX_PANE;
-  private layoutTimer?: ReturnType<typeof setTimeout>;
-  private layoutGeneration = 0;
+  private layoutTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private paneTargets = new Map<string, string | undefined>();
 
   constructor(layout: MultiplexerLayout = 'main-vertical', mainPaneSize = 60) {
     this.storedLayout = layout;
@@ -30,7 +36,7 @@ export class TmuxMultiplexer implements Multiplexer {
       return this.binaryPath !== null;
     }
 
-    this.binaryPath = await this.findBinary();
+    this.binaryPath = await findBinary('tmux', { verify: true });
     this.hasChecked = true;
     return this.binaryPath !== null;
   }
@@ -44,6 +50,7 @@ export class TmuxMultiplexer implements Multiplexer {
     description: string,
     serverUrl: string,
     directory: string,
+    options?: PaneSpawnOptions,
   ): Promise<PaneResult> {
     const tmux = await this.getBinary();
     if (!tmux) {
@@ -53,51 +60,41 @@ export class TmuxMultiplexer implements Multiplexer {
 
     try {
       // Build the attach command
-      const quotedDirectory = quoteShellArg(directory);
-      const quotedUrl = quoteShellArg(serverUrl);
-      const quotedSessionId = quoteShellArg(sessionId);
+      const opencodeCmd = buildOpencodeAttachCommand(
+        sessionId,
+        serverUrl,
+        directory,
+      );
 
-      const opencodeCmd = [
-        'opencode',
-        'attach',
-        quotedUrl,
-        '--session',
-        quotedSessionId,
-        '--dir',
-        quotedDirectory,
-      ].join(' ');
+      const registeredTarget = options?.parentSessionId
+        ? readTmuxPane(options.parentSessionId)
+        : undefined;
+      let targetPane = registeredTarget ?? this.targetPane;
+      let result = await this.splitPane(tmux, targetPane, opencodeCmd);
 
-      // tmux split-window -h -d -P -F '#{pane_id}' <cmd>
-      const args = [
-        'split-window',
-        '-h', // Horizontal split (pane to the right)
-        '-d', // Don't switch focus
-        '-P', // Print pane info
-        '-F',
-        '#{pane_id}', // Format: just the pane ID
-        ...this.targetArgs(),
-        opencodeCmd,
-      ];
+      if (
+        result.exitCode !== 0 &&
+        registeredTarget &&
+        this.targetPane !== registeredTarget
+      ) {
+        log('[tmux] spawnPane: registered target failed, using fallback', {
+          registeredTarget,
+          fallbackTarget: this.targetPane,
+        });
+        targetPane = this.targetPane;
+        result = await this.splitPane(tmux, targetPane, opencodeCmd);
+      }
 
-      log('[tmux] spawnPane: executing', { tmux, args });
-
-      const proc = crossSpawn([tmux, ...args], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-
-      const exitCode = await proc.exited;
-      const stdout = await proc.stdout();
-      const stderr = await proc.stderr();
-      const paneId = stdout.trim();
+      const paneId = result.stdout.trim();
 
       log('[tmux] spawnPane: result', {
-        exitCode,
+        exitCode: result.exitCode,
         paneId,
-        stderr: stderr.trim(),
+        stderr: result.stderr.trim(),
+        targetPane,
       });
 
-      if (exitCode === 0 && paneId) {
+      if (result.exitCode === 0 && paneId) {
         // Rename the pane for visibility
         const renameProc = crossSpawn(
           [tmux, 'select-pane', '-t', paneId, '-T', description.slice(0, 30)],
@@ -106,7 +103,8 @@ export class TmuxMultiplexer implements Multiplexer {
         await renameProc.exited;
 
         // Rebalance panes after bursts of child sessions settle.
-        this.scheduleLayout();
+        this.paneTargets.set(paneId, targetPane);
+        this.scheduleLayout(targetPane);
 
         log('[tmux] spawnPane: SUCCESS', { paneId });
         return { success: true, paneId };
@@ -120,85 +118,49 @@ export class TmuxMultiplexer implements Multiplexer {
   }
 
   async closePane(paneId: string): Promise<boolean> {
-    if (!paneId) {
-      log('[tmux] closePane: no paneId provided');
-      return false;
-    }
-
     const tmux = await this.getBinary();
-    if (!tmux) {
-      log('[tmux] closePane: tmux binary not found');
-      return false;
+    const layoutTarget = this.paneTargets.get(paneId) ?? this.targetPane;
+    const closed = await gracefulClosePane(tmux, paneId, {
+      ctrlC: ['send-keys', '-t', paneId, 'C-c'],
+      close: ['kill-pane', '-t', paneId],
+    });
+    if (closed) {
+      this.paneTargets.delete(paneId);
+      this.scheduleLayout(layoutTarget);
     }
-
-    try {
-      // Send Ctrl+C for graceful shutdown
-      log('[tmux] closePane: sending Ctrl+C', { paneId });
-      const ctrlCProc = crossSpawn([tmux, 'send-keys', '-t', paneId, 'C-c'], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      await ctrlCProc.exited;
-
-      // Wait for graceful shutdown
-      await new Promise((r) => setTimeout(r, 250));
-
-      // Kill the pane
-      log('[tmux] closePane: killing pane', { paneId });
-      const proc = crossSpawn([tmux, 'kill-pane', '-t', paneId], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-
-      const exitCode = await proc.exited;
-      const stderr = await proc.stderr();
-
-      log('[tmux] closePane: result', { exitCode, stderr: stderr.trim() });
-
-      if (exitCode === 0) {
-        // Rebalance panes after bursts of child sessions settle.
-        this.scheduleLayout();
-        return true;
-      }
-
-      // Pane might already be closed
-      log('[tmux] closePane: failed (pane may already be closed)', { paneId });
-      return false;
-    } catch (err) {
-      log('[tmux] closePane: exception', { error: String(err) });
-      return false;
-    }
+    return closed;
   }
 
   async applyLayout(
     layout: MultiplexerLayout,
     mainPaneSize: number,
   ): Promise<void> {
-    if (this.layoutTimer) {
-      clearTimeout(this.layoutTimer);
-      this.layoutTimer = undefined;
-    }
-
-    this.layoutGeneration++;
-    await this.applyLayoutNow(layout, mainPaneSize);
+    for (const timer of this.layoutTimers.values()) clearTimeout(timer);
+    this.layoutTimers.clear();
+    await this.applyLayoutNow(layout, mainPaneSize, this.targetPane);
   }
 
-  private scheduleLayout(): void {
-    if (this.layoutTimer) clearTimeout(this.layoutTimer);
+  private scheduleLayout(targetPane: string | undefined): void {
+    const key = targetPane ?? '';
+    const pending = this.layoutTimers.get(key);
+    if (pending) clearTimeout(pending);
 
-    const gen = ++this.layoutGeneration;
-    this.layoutTimer = setTimeout(() => {
-      this.layoutTimer = undefined;
-      if (this.layoutGeneration === gen) {
-        void this.applyLayoutNow(this.storedLayout, this.storedMainPaneSize);
-      }
+    const timer = setTimeout(() => {
+      this.layoutTimers.delete(key);
+      void this.applyLayoutNow(
+        this.storedLayout,
+        this.storedMainPaneSize,
+        targetPane,
+      );
     }, TMUX_LAYOUT_DEBOUNCE_MS);
-    this.layoutTimer.unref?.();
+    this.layoutTimers.set(key, timer);
+    timer.unref?.();
   }
 
   private async applyLayoutNow(
     layout: MultiplexerLayout,
     mainPaneSize: number,
+    targetPane: string | undefined,
   ): Promise<void> {
     const tmux = await this.getBinary();
     if (!tmux) return;
@@ -211,7 +173,7 @@ export class TmuxMultiplexer implements Multiplexer {
       // Apply the layout
       const layoutResult = await this.runTmux(tmux, [
         'select-layout',
-        ...this.targetArgs(),
+        ...this.targetArgs(targetPane),
         layout,
       ]);
       if (layoutResult !== 0) return;
@@ -223,7 +185,7 @@ export class TmuxMultiplexer implements Multiplexer {
 
         const sizeResult = await this.runTmux(tmux, [
           'set-window-option',
-          ...this.targetArgs(),
+          ...this.targetArgs(targetPane),
           sizeOption,
           `${mainPaneSize}%`,
         ]);
@@ -232,7 +194,7 @@ export class TmuxMultiplexer implements Multiplexer {
         // Reapply layout to use the new size
         const reapplyResult = await this.runTmux(tmux, [
           'select-layout',
-          ...this.targetArgs(),
+          ...this.targetArgs(targetPane),
           layout,
         ]);
         if (reapplyResult !== 0) return;
@@ -272,53 +234,36 @@ export class TmuxMultiplexer implements Multiplexer {
     return this.binaryPath;
   }
 
-  private targetArgs(): string[] {
-    return this.targetPane ? ['-t', this.targetPane] : [];
+  private async splitPane(
+    tmux: string,
+    targetPane: string | undefined,
+    opencodeCmd: string,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    const args = [
+      'split-window',
+      '-h',
+      '-d',
+      '-P',
+      '-F',
+      '#{pane_id}',
+      ...this.targetArgs(targetPane),
+      opencodeCmd,
+    ];
+    log('[tmux] spawnPane: executing', { tmux, args });
+
+    const proc = crossSpawn([tmux, ...args], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      proc.stdout(),
+      proc.stderr(),
+    ]);
+    return { exitCode, stdout, stderr };
   }
 
-  private async findBinary(): Promise<string | null> {
-    const isWindows = process.platform === 'win32';
-    const cmd = isWindows ? 'where' : 'which';
-
-    try {
-      const proc = crossSpawn([cmd, 'tmux'], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-
-      const exitCode = await proc.exited;
-      if (exitCode !== 0) {
-        log("[tmux] findBinary: 'which tmux' failed", { exitCode });
-        return null;
-      }
-
-      const stdout = await proc.stdout();
-      const path = stdout.trim().split('\n')[0];
-      if (!path) {
-        log('[tmux] findBinary: no path in output');
-        return null;
-      }
-
-      // Verify it works
-      const verifyProc = crossSpawn([path, '-V'], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      const verifyExit = await verifyProc.exited;
-      if (verifyExit !== 0) {
-        log('[tmux] findBinary: tmux -V failed', { path, verifyExit });
-        return null;
-      }
-
-      log('[tmux] findBinary: found', { path });
-      return path;
-    } catch (err) {
-      log('[tmux] findBinary: exception', { error: String(err) });
-      return null;
-    }
+  private targetArgs(targetPane = this.targetPane): string[] {
+    return targetPane ? ['-t', targetPane] : [];
   }
-}
-
-function quoteShellArg(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

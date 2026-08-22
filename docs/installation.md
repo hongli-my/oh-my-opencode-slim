@@ -36,8 +36,8 @@ The installer supports the following options:
 | `--skills=yes|no` | Install bundled skills (default: yes) |
 | `--companion=ask\|yes\|no` | Install and enable the desktop Companion (`ask` by default; prompt defaults to no) |
 | `--preset=<name>` | Active generated config preset: `openai` or `opencode-go` (default: `openai`) |
-| `--background-subagents=ask\|yes\|no` | Configure the required background-subagents environment export (`ask` by default; prompt defaults to yes) |
-| `--background-subagents-target=<path>` | Write the background-subagents export to a specific shell/profile file |
+| `--background-subagents=ask\|yes\|no` | Configure the required background-subagents and Exa websearch environment exports (`ask` by default; prompt defaults to yes) |
+| `--background-subagents-target=<path>` | Write the background-subagents and websearch exports to a specific shell/profile file |
 | `--no-tui` | Non-interactive mode |
 | `--dry-run` | Simulate install without writing files |
 | `--reset` | Force overwrite of existing configuration |
@@ -49,10 +49,13 @@ background subagents, which are enabled by this environment variable:
 
 ```bash
 OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
+OPENCODE_ENABLE_EXA=1
 ```
 
-The installer asks before adding that export to your shell startup file. The
+The installer asks before adding those exports to your shell startup file. The
 prompt defaults to `yes` because V2's default orchestration depends on it.
+The Exa flag enables OpenCode's built-in `websearch` tool without requiring an
+API key.
 
 ```bash
 bunx oh-my-opencode-slim@latest install
@@ -76,7 +79,7 @@ source ~/.bashrc
 For a one-shot manual launch without restarting your terminal:
 
 ```bash
-OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true opencode
+OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true OPENCODE_ENABLE_EXA=1 opencode
 ```
 
 ### Non-Destructive Behavior
@@ -97,13 +100,16 @@ bunx oh-my-opencode-slim@latest install --reset
 
 ### After Installation
 
-The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default (using variant-aware `gpt-5.5` and `gpt-5.4-mini` models, including `gpt-5.5 (medium)` for Orchestrator, `gpt-5.5 (high)` for Oracle, `gpt-5.5 (low)` for Fixer, and `gpt-5.4-mini` variants for other specialists). To make OpenCode Go active during install, run `bunx oh-my-opencode-slim@latest install --preset=opencode-go`. That preset uses GLM-5.1 for Orchestrator, so the installer also enables Observer with `opencode-go/kimi-k2.6` for visual analysis. To switch providers later or build a mixed setup, use **[Configuration Reference](configuration.md)** for the full option reference and the preset docs for copyable examples.
+The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default (using variant-aware GPT-5.6 models, including `gpt-5.6-terra (medium)` for Orchestrator, `gpt-5.6-sol (high)` for Oracle, `gpt-5.6-luna (medium)` for Fixer, and `gpt-5.6-luna` variants for other specialists). To make OpenCode Go active during install, run `bunx oh-my-opencode-slim@latest install --preset=opencode-go`. That preset uses Minimax-M3 for Orchestrator, so the installer also enables Observer with `opencode-go/mimo-v2.5` for visual analysis. To switch providers later or build a mixed setup, use **[Configuration Reference](configuration.md)** for the full option reference and the preset docs for copyable examples.
 
-When auto-update successfully installs a newer package version, it also copies
-new bundled skills from that updated package into your OpenCode skills directory
-if they are missing. This is additive only: existing skill folders are skipped,
-and skills are never removed automatically. Restart OpenCode after an auto-update
-to load the updated plugin and any newly copied skills.
+The plugin safely reconciles bundled skills on startup and after successful
+auto-updates. Missing bundled skills are installed, and previously managed skills
+are updated only when their local files still match a known plugin-installed
+version. If you customized a skill locally, the plugin preserves your active copy
+and stages the new bundled version under
+`~/.config/opencode/.oh-my-opencode-slim/skill-updates/` for manual review.
+Restart OpenCode after an auto-update to load the updated plugin and any changed
+skills.
 
 Then:
 
@@ -328,17 +334,43 @@ See the [Multiplexer Integration Guide](multiplexer-integration.md) for more det
 
 ## Uninstallation
 
-1. **Remove the plugin from your OpenCode config**:
+### Required
 
-   Edit `~/.config/opencode/opencode.json` and remove `"oh-my-opencode-slim"` from the `plugin` array.
+1. Remove the plugin from your OpenCode config:
 
-2. **Remove configuration files (optional)**:
+   Edit `~/.config/opencode/opencode.json` and remove `"oh-my-opencode-slim"` from the `plugin` array. If the installer enabled LSP (it only does so when no explicit `lsp` setting exists), set `"lsp": false` or remove the `"lsp"` key.
+
+2. Remove the TUI badge:
+
+   Edit `~/.config/opencode/tui.json` and remove `"oh-my-opencode-slim"` from the `plugin` array.
+
+### Optional Cleanup
+
+3. Re-enable default agents:
+
+   In `~/.config/opencode/opencode.json`, remove the `disable: true` entries the installer added under `agent.explore` and `agent.general`.
+
+4. Remove the environment variable:
+
+   The installer may have added an export to your shell startup file. Remove the `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` line from your shell config:
+   - `~/.zshrc` (Zsh)
+   - `~/.bashrc` (Bash)
+   - `~/.config/fish/conf.d/opencode-background-subagents.fish` (Fish) — also remove `set -gx OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS true`
+
+   Restart your terminal or `source` the file.
+
+5. Clear the plugin cache:
+   ```bash
+   rm -rf ~/.cache/opencode/packages/oh-my-opencode-slim@*
+   ```
+
+6. Remove configuration files:
    ```bash
    rm -f ~/.config/opencode/oh-my-opencode-slim.json
    rm -f ~/.config/opencode/oh-my-opencode-slim.json.bak
    ```
 
-3. **Remove skills (optional)**:
+7. Remove skills installed by the installer:
    ```bash
    rm -rf ~/.config/opencode/skills/simplify
    rm -rf ~/.config/opencode/skills/codemap
@@ -348,3 +380,16 @@ See the [Multiplexer Integration Guide](multiplexer-integration.md) for more det
    rm -rf ~/.config/opencode/skills/worktrees
    rm -rf ~/.config/opencode/skills/oh-my-opencode-slim
    ```
+
+   > **Note:** The installer manages these specific skills. If you added others manually, they won't be affected.
+
+8. Remove the desktop companion binary (if installed):
+
+   The companion is optional and not installed by default. If you installed it:
+   ```bash
+   rm -rf ~/.local/share/opencode/storage/oh-my-opencode-slim
+   ```
+
+### Verify
+
+Run `opencode auth status` and confirm oh-my-opencode-slim agents no longer appear.

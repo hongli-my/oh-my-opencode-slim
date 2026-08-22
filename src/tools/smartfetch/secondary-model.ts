@@ -1,14 +1,19 @@
-import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import type { PluginInput } from '@opencode-ai/plugin';
-import { stripJsonComments } from '../../cli/config-io';
-import { getConfigSearchDirs } from '../../cli/paths';
-import { loadPluginConfig } from '../../config/loader';
+import { getClient } from '../../utils/opencode-client';
+import { abortSessionWithTimeout } from '../../utils/session';
 import { MAX_MODEL_CONTENT_CHARS } from './constants';
 import type { CachedFetch, SecondaryModel } from './types';
 
-type OpenCodeClient = PluginInput['client'];
+export interface SecondaryModelResolutionInput {
+  /** Dedicated webfetch model(s) from the plugin config (highest priority). */
+  webfetchModels?: Array<{ id: string; variant?: string }>;
+  /** `small_model` from the host's already-loaded merged OpenCode config. */
+  smallModel?: string;
+  /** Explorer agent model id, resolved from in-memory config at construction. */
+  explorerModel?: string;
+  /** Librarian agent model id, resolved from in-memory config at construction. */
+  librarianModel?: string;
+}
 
 function parseModelRef(value: string | undefined) {
   if (!value) return undefined;
@@ -18,7 +23,7 @@ function parseModelRef(value: string | undefined) {
   return { providerID, modelID };
 }
 
-function pickAgentModelRef(value: unknown): string | undefined {
+export function pickAgentModelRef(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
     for (const entry of value) {
@@ -36,78 +41,49 @@ function pickAgentModelRef(value: unknown): string | undefined {
   return undefined;
 }
 
-function findPreferredOpenCodeConfigPath(baseDir: string) {
-  for (const file of ['opencode.jsonc', 'opencode.json']) {
-    const fullPath = path.join(baseDir, file);
-    if (existsSync(fullPath)) return fullPath;
-  }
-  return undefined;
-}
-
-async function readOpenCodeConfigFile(configPath: string | undefined) {
-  if (!configPath) return undefined;
-  try {
-    const content = await readFile(configPath, 'utf8');
-    return JSON.parse(stripJsonComments(content)) as {
-      small_model?: unknown;
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-async function readEffectiveOpenCodeConfig(directory: string) {
-  const projectDir = path.join(directory, '.opencode');
-  const userDirs = getConfigSearchDirs();
-  const projectPath = findPreferredOpenCodeConfigPath(projectDir);
-  const userPath = userDirs
-    .map((configDir) => findPreferredOpenCodeConfigPath(configDir))
-    .find(Boolean);
-
-  const userConfig = await readOpenCodeConfigFile(userPath);
-  const projectConfig = await readOpenCodeConfigFile(projectPath);
-
-  return {
-    small_model: projectConfig?.small_model ?? userConfig?.small_model,
+/**
+ * Resolve the secondary-model chain purely from in-memory inputs.
+ *
+ * No filesystem or config-file access: every value is captured once at
+ * plugin construction (`src/index.ts`) from the already-loaded plugin config
+ * and the host's merged OpenCode config. Keeps the webfetch hot path free of
+ * disk reads.
+ */
+export function resolveSecondaryModels(
+  input: SecondaryModelResolutionInput = {},
+): SecondaryModel[] {
+  const models: SecondaryModel[] = [];
+  const seen = new Set<string>();
+  const addModel = (model: SecondaryModel) => {
+    const key = `${model.providerID}/${model.modelID}${model.variant ? `#${model.variant}` : ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    models.push(model);
   };
-}
 
-export async function readSecondaryModelFromConfig(directory: string) {
-  try {
-    const models: SecondaryModel[] = [];
-    const seen = new Set<string>();
-    const pushModel = (value: unknown) => {
-      if (typeof value !== 'string') return;
-      const parsedModel = parseModelRef(value);
-      if (!parsedModel) return;
-      const key = `${parsedModel.providerID}/${parsedModel.modelID}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      models.push(parsedModel);
-    };
-
-    const opencodeConfig = await readEffectiveOpenCodeConfig(directory);
-    pushModel(
-      typeof opencodeConfig.small_model === 'string'
-        ? opencodeConfig.small_model
-        : undefined,
-    );
-
-    const pluginConfig = loadPluginConfig(directory);
-    const explorerModel = pickAgentModelRef(
-      pluginConfig.agents?.explorer?.model,
-    );
-    const librarianModel = pickAgentModelRef(
-      pluginConfig.agents?.librarian?.model,
-    );
-
-    pushModel(explorerModel);
-    pushModel(librarianModel);
-
-    return models;
-  } catch {
-    return [];
+  // Dedicated webfetch model(s) take highest priority, in order
+  if (input.webfetchModels) {
+    for (const ref of input.webfetchModels) {
+      const parsedModel = parseModelRef(ref.id);
+      if (!parsedModel) continue;
+      addModel({ ...parsedModel, variant: ref.variant });
+    }
   }
+
+  const parsedSmall = parseModelRef(input.smallModel);
+  if (parsedSmall) addModel(parsedSmall);
+
+  const parsedExplorer = input.explorerModel
+    ? parseModelRef(input.explorerModel)
+    : undefined;
+  if (parsedExplorer) addModel(parsedExplorer);
+
+  const parsedLibrarian = input.librarianModel
+    ? parseModelRef(input.librarianModel)
+    : undefined;
+  if (parsedLibrarian) addModel(parsedLibrarian);
+
+  return models;
 }
 
 function buildPrompt(content: string, prompt: string) {
@@ -159,6 +135,23 @@ function isUsableSecondaryText(text: string) {
 const SESSION_DELETE_RETRIES = 3;
 const SESSION_DELETE_RETRY_DELAY_MS = 500;
 const SECONDARY_MODEL_TIMEOUT_MS = 30_000;
+const activeSecondaryModelClients = new WeakSet<object>();
+
+function acquireSecondaryModelLease(client: object): () => void {
+  if (activeSecondaryModelClients.has(client)) {
+    throw new Error(
+      'A secondary model session cleanup is still pending; using fetched content without starting another session',
+    );
+  }
+
+  activeSecondaryModelClients.add(client);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeSecondaryModelClients.delete(client);
+  };
+}
 
 /**
  * Exposed for tests so they can avoid real wall-clock sleeps.
@@ -166,6 +159,7 @@ const SECONDARY_MODEL_TIMEOUT_MS = 30_000;
  */
 export const _testConfig = {
   deleteRetryDelayMs: SESSION_DELETE_RETRY_DELAY_MS,
+  secondaryModelTimeoutMs: SECONDARY_MODEL_TIMEOUT_MS,
 };
 
 /**
@@ -178,15 +172,15 @@ export const _testConfig = {
  * issue is visible instead of silently leaking sessions.
  */
 async function deleteSessionSafely(
-  client: OpenCodeClient,
+  input: PluginInput,
   sessionId: string,
-  directory: string,
 ): Promise<void> {
+  const client = getClient(input);
   for (let attempt = 1; attempt <= SESSION_DELETE_RETRIES; attempt++) {
     try {
       await client.session.delete({
         path: { id: sessionId },
-        query: { directory },
+        query: { directory: input.directory },
       });
       return;
     } catch (error) {
@@ -206,80 +200,90 @@ async function deleteSessionSafely(
 }
 
 async function runSecondaryModel(
-  client: OpenCodeClient,
-  directory: string,
+  input: PluginInput,
   model: SecondaryModel,
   prompt: string,
   content: string,
+  parentSessionID?: string,
 ) {
-  const session = await client.session.create({
-    responseStyle: 'data',
-    throwOnError: true,
-    query: { directory },
-    body: { title: 'smartfetch-secondary' },
-  });
-
-  const sessionId =
-    (session as { data?: { id?: string }; id?: string })?.data?.id ??
-    (session as { data?: { id?: string }; id?: string })?.id;
-  if (!sessionId) {
-    throw new Error('Secondary model session did not return an id');
-  }
-
-  const sourceChars = content.length;
-  const truncatedContent = content.slice(0, MAX_MODEL_CONTENT_CHARS);
-  const inputChars = truncatedContent.length;
-  const inputTruncated = inputChars < sourceChars;
-  const effectivePrompt = inputTruncated
-    ? `${prompt}\n\nNote: only the first ${inputChars} characters of a longer fetched document were provided.`
-    : prompt;
+  const client = getClient(input);
+  const directory = input.directory;
+  const releaseLease = acquireSecondaryModelLease(client);
+  let sessionId: string | undefined;
+  let promptPromise: Promise<unknown> | undefined;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let promptTimedOut = false;
   try {
-    const toolIDsResponse = await client.tool.ids({
-      responseStyle: 'data',
+    const sessionResponse = await client.session.create({
+      query: { directory },
+      body: {
+        title: 'smartfetch-secondary',
+        ...(parentSessionID ? { parentID: parentSessionID } : {}),
+      },
       throwOnError: true,
     });
-    const toolIDsData = toolIDsResponse as { data?: unknown };
-    const toolIDs = Array.isArray(toolIDsData.data)
-      ? (toolIDsData.data as string[])
-      : Array.isArray(toolIDsResponse)
-        ? toolIDsResponse
-        : [];
+
+    const session = sessionResponse.data;
+    sessionId = session?.id;
+    if (!sessionId) {
+      const errorDetail =
+        sessionResponse && 'error' in sessionResponse
+          ? `: ${JSON.stringify(sessionResponse.error)}`
+          : '';
+      throw new Error(
+        `Secondary model session did not return an id${errorDetail}`,
+      );
+    }
+
+    const sourceChars = content.length;
+    const truncatedContent = content.slice(0, MAX_MODEL_CONTENT_CHARS);
+    const inputChars = truncatedContent.length;
+    const inputTruncated = inputChars < sourceChars;
+    const effectivePrompt = inputTruncated
+      ? `${prompt}\n\nNote: only the first ${inputChars} characters of a longer fetched document were provided.`
+      : prompt;
+    const toolIDsResponse = await client.tool.ids({
+      query: { directory },
+    });
+    const toolIDs = toolIDsResponse.data ?? [];
     const disabledTools = Object.fromEntries(
       (toolIDs || []).map((id: string) => [id, false]),
     );
 
+    const { variant, ...modelOnly } = model;
+    promptPromise = client.session.prompt({
+      path: { id: sessionId },
+      query: { directory },
+      body: {
+        model: modelOnly,
+        // The v1 runtime reads the variant from the body top level and
+        // strips unknown keys from `model`; the SDK type omits it, so
+        // spread it through the body shape directly.
+        ...(variant ? { variant } : {}),
+        system:
+          'Answer only from the supplied content. Do not use tools or outside knowledge.',
+        tools: disabledTools,
+        parts: [
+          {
+            type: 'text',
+            text: buildPrompt(truncatedContent, effectivePrompt),
+          },
+        ],
+      },
+    });
     const result = await Promise.race([
-      client.session.prompt({
-        responseStyle: 'data',
-        throwOnError: true,
-        path: { id: sessionId },
-        query: { directory },
-        body: {
-          model,
-          system:
-            'Answer only from the supplied content. Do not use tools or outside knowledge.',
-          tools: disabledTools,
-          parts: [
-            {
-              type: 'text',
-              text: buildPrompt(truncatedContent, effectivePrompt),
-            },
-          ],
-        },
+      promptPromise,
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          promptTimedOut = true;
+          reject(new Error('Secondary model timed out'));
+        }, _testConfig.secondaryModelTimeoutMs);
       }),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error('Secondary model timed out')),
-          SECONDARY_MODEL_TIMEOUT_MS,
-        ),
-      ),
     ]);
 
     const parts =
       (result as { data?: { parts?: Array<{ type?: string; text?: string }> } })
-        ?.data?.parts ??
-      (result as { parts?: Array<{ type?: string; text?: string }> })?.parts ??
-      [];
+        ?.data?.parts ?? [];
     const text = parts
       .map((part) => (part?.type === 'text' ? part.text || '' : ''))
       .join('')
@@ -291,27 +295,52 @@ async function runSecondaryModel(
       inputChars,
       sourceChars,
     };
+  } catch (error) {
+    if (promptTimedOut && sessionId) {
+      try {
+        await abortSessionWithTimeout(client, sessionId);
+      } catch {
+        // Keep the original timeout error. Cleanup remains gated on the
+        // prompt settling so a failed abort cannot recreate the FK race.
+      }
+    }
+    throw error;
   } finally {
-    await deleteSessionSafely(client, sessionId, directory);
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    const cleanupSessionId = sessionId;
+    if (promptTimedOut && promptPromise && cleanupSessionId) {
+      void promptPromise
+        .catch(() => undefined)
+        .then(() => deleteSessionSafely(input, cleanupSessionId))
+        .finally(releaseLease);
+    } else if (cleanupSessionId) {
+      try {
+        await deleteSessionSafely(input, cleanupSessionId);
+      } finally {
+        releaseLease();
+      }
+    } else {
+      releaseLease();
+    }
   }
 }
 
 export async function runSecondaryModelWithFallback(
-  client: OpenCodeClient,
-  directory: string,
+  input: PluginInput,
   models: SecondaryModel[],
   prompt: string,
   content: string,
+  parentSessionID?: string,
 ) {
   let lastError: unknown;
   for (const model of models) {
     try {
       const result = await runSecondaryModel(
-        client,
-        directory,
+        input,
         model,
         prompt,
         content,
+        parentSessionID,
       );
       if (!isUsableSecondaryText(result.text)) {
         lastError = new Error('Secondary model returned no usable text');

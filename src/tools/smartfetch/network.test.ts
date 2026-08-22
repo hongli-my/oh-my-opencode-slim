@@ -3,6 +3,7 @@ import {
   buildAllowedOrigins,
   buildConditionalHeaders,
   fetchWithRedirects,
+  normalizeUrl,
 } from './network';
 
 describe('smartfetch/network', () => {
@@ -11,6 +12,31 @@ describe('smartfetch/network', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     mock.restore();
+  });
+
+  test('normalizeUrl strips the fragment from fetch URLs only', () => {
+    const normalized = normalizeUrl('https://example.com/docs#sec1');
+
+    expect(normalized.url).toBe('https://example.com/docs');
+    expect(normalized.originalUrl).toBe('https://example.com/docs#sec1');
+    expect(normalized.fallbackUrl).toBeUndefined();
+    expect(normalized.upgradedToHttps).toBe(false);
+  });
+
+  test('normalizeUrl strips fragments from the http fallback URL too', () => {
+    const normalized = normalizeUrl('http://example.com/docs#sec1');
+
+    expect(normalized.url).toBe('https://example.com/docs');
+    expect(normalized.originalUrl).toBe('http://example.com/docs#sec1');
+    expect(normalized.fallbackUrl).toBe('http://example.com/docs');
+    expect(normalized.upgradedToHttps).toBe(true);
+  });
+
+  test('normalizeUrl keeps origin and query string while dropping the fragment', () => {
+    const normalized = normalizeUrl('https://example.com/docs?page=2#anchor');
+
+    expect(normalized.url).toBe('https://example.com/docs?page=2');
+    expect(new URL(normalized.url).origin).toBe('https://example.com');
   });
 
   test('collects unique allowed origins from permission patterns', () => {

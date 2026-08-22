@@ -1,6 +1,6 @@
 {
   "name": "oh-my-opencode-slim",
-  "version": "2.0.6",
+  "version": "2.2.15",
   "description": "Lightweight agent orchestration plugin for OpenCode - a slimmed-down fork of oh-my-opencode",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -8,6 +8,9 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./server": {
+      "import": "./dist/server.js"
     },
     "./tui": {
       "import": "./dist/tui.js",
@@ -51,9 +54,10 @@
   ],
   "scripts": {
     "clean:dist": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
-    "build:plugin": "bun build src/index.ts src/tui.ts --outdir dist --target node --format esm --external @ast-grep/napi --external @opencode-ai/plugin --external @opencode-ai/plugin/* --external @opencode-ai/sdk --external @opencode-ai/sdk/* --external @opentui/core --external @opentui/solid --external jsdom --external zod",
-    "build:cli": "bun build src/cli/index.ts --outdir dist/cli --target node --format esm --external @ast-grep/napi --external @opencode-ai/plugin --external @opencode-ai/plugin/* --external @opencode-ai/sdk --external @opencode-ai/sdk/* --external jsdom --external zod",
-    "build": "bun run clean:dist && bun run build:plugin && bun run build:cli && tsc --emitDeclarationOnly && bun run generate-schema",
+    "build:plugin": "bun build src/index.ts src/tui.ts --outdir dist --target node --format esm --external @ast-grep/napi --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opencode-ai/sdk --external @opencode-ai/sdk/v2 --external @opentui/core --external @opentui/solid --external jsdom --external zod",
+    "build:v2": "bun build src/index.ts --outfile dist/server.js --target node --format esm --external @ast-grep/napi --external jsdom",
+    "build:cli": "bun build src/cli/index.ts --outdir dist/cli --target node --format esm --external @ast-grep/napi --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opencode-ai/sdk --external @opencode-ai/sdk/v2 --external jsdom --external zod",
+    "build": "bun run clean:dist && bun run build:plugin && bun run build:v2 && bun run build:cli && tsc --emitDeclarationOnly && bun run generate-schema",
     "prepare": "bun run build",
     "contributors:add": "all-contributors add",
     "contributors:check": "all-contributors check",
@@ -61,6 +65,8 @@
     "generate-schema": "bun run scripts/generate-schema.ts",
     "verify:release": "bun run scripts/verify-release-artifact.ts",
     "verify:host-smoke": "bun run scripts/verify-opencode-host-smoke.ts",
+    "verify:cache-stability": "bun run scripts/verify-opencode-cache-stability.ts",
+    "cache:smoke": "bun run scripts/cache-smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "lint": "biome lint .",
@@ -76,27 +82,27 @@
     "release:beta:next": "npm version prerelease --preid beta && git push --follow-tags && npm publish --tag beta"
   },
   "dependencies": {
-    "@ast-grep/cli": "^0.42.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@ast-grep/cli": "^0.44.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@mozilla/readability": "^0.6.0",
-    "@opencode-ai/plugin": "^1.3.17",
-    "@opencode-ai/sdk": "^1.3.17",
-    "jsdom": "^26.1.0",
-    "lru-cache": "^11.3.3",
+    "@opencode-ai/plugin": "1.18.13",
+    "@opencode-ai/sdk": "1.18.13",
+    "jsdom": "^29.0.0",
+    "lru-cache": "^11.5.2",
     "turndown": "^7.2.4"
   },
   "optionalDependencies": {
     "@opentui/solid": "^0.1.97"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.11",
-    "@types/jsdom": "^21.1.7",
-    "@types/node": "^24.6.1",
+    "@biomejs/biome": "2.5.4",
+    "@types/jsdom": "28",
+    "@types/node": "^26.1.1",
     "@types/turndown": "^5.0.6",
     "all-contributors-cli": "^6.26.1",
-    "bun-types": "1.3.12",
-    "typescript": "^5.9.3",
-    "zod": "^4.3.6"
+    "bun-types": "^1.3.14",
+    "typescript": "7.0",
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
     "zod": "^4.0.0"

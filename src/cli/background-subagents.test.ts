@@ -54,12 +54,16 @@ describe('background subagents helpers', () => {
   });
 
   test('builds shell-specific managed blocks with true', () => {
-    expect(getBackgroundSubagentsBlock('/tmp/.bashrc')).toContain(
+    const bashBlock = getBackgroundSubagentsBlock('/tmp/.bashrc');
+    const fishBlock = getBackgroundSubagentsBlock('/tmp/config.fish');
+    expect(bashBlock).toContain(
       'export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true',
     );
-    expect(getBackgroundSubagentsBlock('/tmp/config.fish')).toContain(
+    expect(bashBlock).toContain('export OPENCODE_ENABLE_EXA=1');
+    expect(fishBlock).toContain(
       'set -gx OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS true',
     );
+    expect(fishBlock).toContain('set -gx OPENCODE_ENABLE_EXA 1');
   });
 
   test('prints fish manual instructions for fish targets', () => {
@@ -71,8 +75,9 @@ describe('background subagents helpers', () => {
       'set -gx OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS true',
     );
     expect(instructions).toContain(
-      'env OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true opencode',
+      'env OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true OPENCODE_ENABLE_EXA=1 opencode',
     );
+    expect(instructions).toContain('set -gx OPENCODE_ENABLE_EXA 1');
   });
 
   test('expands tilde target paths', () => {
@@ -154,10 +159,17 @@ describe('parseArgs companion', () => {
   });
 });
 
+describe('parseArgs skills', () => {
+  test('parses force skill synchronization mode', () => {
+    expect(parseArgs(['--skills=force']).skills).toBe('force');
+  });
+});
+
 describe('configureBackgroundSubagents', () => {
   let tempDir: string | undefined;
   const originalBackgroundEnv =
     process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
+  const originalExaEnv = process.env.OPENCODE_ENABLE_EXA;
 
   afterEach(() => {
     if (tempDir) rmSync(tempDir, { recursive: true, force: true });
@@ -168,7 +180,75 @@ describe('configureBackgroundSubagents', () => {
       process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS =
         originalBackgroundEnv;
     }
+    if (originalExaEnv === undefined) {
+      delete process.env.OPENCODE_ENABLE_EXA;
+    } else {
+      process.env.OPENCODE_ENABLE_EXA = originalExaEnv;
+    }
   });
+
+  test.each(['true', '1', 'TRUE'])(
+    'returns already enabled without writing the target when Exa is %s',
+    async (exaValue) => {
+      tempDir = mkdtempSync(join(tmpdir(), 'omoo-bg-'));
+      const target = join(tempDir, '.zshrc');
+      writeFileSync(target, 'preserve=true\n');
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'true';
+      process.env.OPENCODE_ENABLE_EXA = exaValue;
+      const log = spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        const result = await configureBackgroundSubagents({
+          installCustomSkills: false,
+          promptForStar: false,
+          reset: false,
+          backgroundSubagents: 'yes',
+          backgroundSubagentsTarget: target,
+        });
+
+        expect(result).toEqual({ enabledNow: true });
+        expect(readFileSync(target, 'utf8')).toBe('preserve=true\n');
+        expect(log.mock.calls.join('\n')).toContain(
+          'already enabled in environment',
+        );
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
+
+  test.each([undefined, 'yes', 'false'])(
+    'writes Exa configuration when Exa is %s',
+    async (exaValue) => {
+      tempDir = mkdtempSync(join(tmpdir(), 'omoo-bg-'));
+      const target = join(tempDir, '.zshrc');
+      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = 'true';
+      if (exaValue === undefined) {
+        delete process.env.OPENCODE_ENABLE_EXA;
+      } else {
+        process.env.OPENCODE_ENABLE_EXA = exaValue;
+      }
+      const log = spyOn(console, 'log').mockImplementation(() => undefined);
+
+      try {
+        const result = await configureBackgroundSubagents({
+          installCustomSkills: false,
+          promptForStar: false,
+          reset: false,
+          backgroundSubagents: 'yes',
+          backgroundSubagentsTarget: target,
+        });
+
+        expect(result).toEqual({ enabledNow: false, configuredTarget: target });
+        expect(readFileSync(target, 'utf8')).toContain('OPENCODE_ENABLE_EXA=1');
+        expect(log.mock.calls.join('\n')).not.toContain(
+          'already enabled in environment',
+        );
+      } finally {
+        log.mockRestore();
+      }
+    },
+  );
 
   test('writes shell config without prompting', async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'omoo-bg-'));
@@ -181,7 +261,6 @@ describe('configureBackgroundSubagents', () => {
 
     try {
       const result = await configureBackgroundSubagents({
-        hasTmux: false,
         installCustomSkills: false,
         promptForStar: false,
         reset: false,
@@ -192,8 +271,11 @@ describe('configureBackgroundSubagents', () => {
       expect(readFileSync(join(tempDir, '.zshrc'), 'utf8')).toContain(
         'OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS',
       );
+      expect(readFileSync(join(tempDir, '.zshrc'), 'utf8')).toContain(
+        'OPENCODE_ENABLE_EXA=1',
+      );
       expect(log.mock.calls.join('\n')).toContain(
-        'Background subagents enabled',
+        'Background subagents and Exa websearch enabled',
       );
     } finally {
       process.env.SHELL = originalShell;
@@ -215,7 +297,6 @@ describe('configureBackgroundSubagents', () => {
 
     try {
       const result = await configureBackgroundSubagents({
-        hasTmux: false,
         installCustomSkills: false,
         promptForStar: false,
         reset: false,

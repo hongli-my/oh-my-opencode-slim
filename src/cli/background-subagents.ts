@@ -6,6 +6,7 @@ export type BackgroundSubagentsMode = 'ask' | 'yes' | 'no';
 export type ShellKind = 'bash' | 'fish' | 'zsh';
 
 const ENV_NAME = 'OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS';
+const EXA_ENV_NAME = 'OPENCODE_ENABLE_EXA';
 const START_MARKER = '# >>> oh-my-opencode-slim background subagents >>>';
 const END_MARKER = '# <<< oh-my-opencode-slim background subagents <<<';
 
@@ -46,11 +47,11 @@ export function detectBackgroundSubagentsTarget(
 
 export function getBackgroundSubagentsBlock(targetPath: string): string {
   const isFish = targetPath.endsWith('.fish');
-  const command = isFish
-    ? `set -gx ${ENV_NAME} true`
-    : `export ${ENV_NAME}=true`;
+  const commands = isFish
+    ? `set -gx ${ENV_NAME} true\nset -gx ${EXA_ENV_NAME} 1`
+    : `export ${ENV_NAME}=true\nexport ${EXA_ENV_NAME}=1`;
 
-  return `${START_MARKER}\n${command}\n${END_MARKER}`;
+  return `${START_MARKER}\n${commands}\n${END_MARKER}`;
 }
 
 export function manualBackgroundSubagentsInstructions(options?: {
@@ -63,16 +64,18 @@ export function manualBackgroundSubagentsInstructions(options?: {
     detectShellKind(options?.targetPath);
   const bashZshSnippet = `export ${ENV_NAME}=true`;
   const fishSnippet = `set -gx ${ENV_NAME} true`;
+  const bashZshExaSnippet = `export ${EXA_ENV_NAME}=1`;
+  const fishExaSnippet = `set -gx ${EXA_ENV_NAME} 1`;
 
   if (shell === 'fish') {
-    return `Start OpenCode with background subagents enabled:\n  env ${ENV_NAME}=true opencode\n\nOr add this to your fish startup file:\n  ${fishSnippet}`;
+    return `Start OpenCode with background subagents and websearch enabled:\n  env ${ENV_NAME}=true ${EXA_ENV_NAME}=1 opencode\n\nOr add these to your fish startup file:\n  ${fishSnippet}\n  ${fishExaSnippet}`;
   }
 
   if (shell === 'bash' || shell === 'zsh') {
-    return `Start OpenCode with background subagents enabled:\n  ${ENV_NAME}=true opencode\n\nOr add this to your shell startup file:\n  ${bashZshSnippet}`;
+    return `Start OpenCode with background subagents and websearch enabled:\n  ${ENV_NAME}=true ${EXA_ENV_NAME}=1 opencode\n\nOr add these to your shell startup file:\n  ${bashZshSnippet}\n  ${bashZshExaSnippet}`;
   }
 
-  return `Start OpenCode with background subagents enabled:\n  ${ENV_NAME}=true opencode\n\nOr add one of these to your shell startup file:\n  bash/zsh: ${bashZshSnippet}\n  fish: ${fishSnippet}`;
+  return `Start OpenCode with background subagents and websearch enabled:\n  ${ENV_NAME}=true ${EXA_ENV_NAME}=1 opencode\n\nOr add the matching pair to your shell startup file:\n  bash/zsh: ${bashZshSnippet}\n            ${bashZshExaSnippet}\n  fish: ${fishSnippet}\n        ${fishExaSnippet}`;
 }
 
 export function expandHomePath(targetPath: string): string {

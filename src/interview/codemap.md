@@ -19,6 +19,10 @@
 
 - `index.ts` exports `createInterviewManager`.
 
+- `runtime.ts` defines the interview-only session boundary (`messages`,
+  `notify`, `continue`, and `rename`). v1 uses nested SDK calls; v2 supplies a
+  context-backed implementation without expanding the global client shim.
+
 - `manager.ts` (composition root)
   - Creates `createInterviewService(ctx, interviewConfig)` once.
   - Chooses mode via
@@ -26,7 +30,8 @@
   - In dashboard mode:
     - calls `tryBecomeDashboard(...)` to elect one process as dashboard,
     - non-dashboard processes read auth token via `readDashboardAuthFile(port)`,
-    - sessions are registered with `/api/register` and sync state back via `/api/interviews/{id}/state`,
+    - sessions are registered with `/api/register`, unregister during cleanup via
+      `/api/unregister`, and sync state back via `/api/interviews/{id}/state`,
     - 10-second fallback polling keeps answer/nudge delivery active if needed.
   - Returns event hooks:
     `registerCommand`, `handleCommandExecuteBefore`, `handleEvent`.
@@ -80,7 +85,7 @@
 - Supporting modules:
   - `document.ts`: markdown/file helpers (`slugify`, path resolution, frontmatter,
     title/summary extraction).
-  - `parser.ts`: assistant state parse pipeline (`parseInterviewState`,
+  - `parser.ts`: assistant state parse pipeline (`parseAssistantState`,
     `findLatestAssistantState`, `buildFallbackState`).
   - `prompts.ts`: prompt templates for create/resume/answer/nudge.
   - `helpers.ts`: request parsing and HTML/JSON response helpers.
@@ -111,7 +116,8 @@
 
 - `handleCommandExecuteBefore`
   - blank input with no active interview starts ideation,
-  - matching slug/path resumes an existing interview,
+  - matching slug/path resumes an existing interview only for its durable
+    frontmatter owner session,
   - otherwise creates a new interview and injects kickoff prompt.
 
 - `handleEvent`
@@ -131,3 +137,20 @@
   - manual file/discovery settings.
 - Existing tests cover service, parser, manager, server, dashboard, and helpers
   under `src/interview/*.test.ts`.
+
+## Repaired lifecycle details
+
+- The interview-only `runtime.ts` boundary owns message reads, notifications,
+  orchestrator continuation, and session rename operations. The v2 bridge uses
+  this boundary instead of expanding the global client shim.
+- After `confirm-complete`, the next clean assistant response is persisted with
+  `rewriteInterviewDocumentWithFinalSpec` only after an idle/text-ended
+  completion event; a stream prefix cannot overwrite the final markdown.
+- Dashboard clients register at `/api/register`, unregister at
+  `/api/unregister`, and receive `202 {"status":"queued"}` for deferred
+  browser submissions. Session polling claims each queued value and must
+  acknowledge it after service delivery; rejected deliveries roll the claim
+  back without clearing the answer, chat message, block comment, or nudge.
+- Markdown documents persist their owning `sessionID` in frontmatter. A
+  different session cannot resume or mutate an owned document, while the
+  original session can resume it across plugin processes.

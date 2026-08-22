@@ -46,7 +46,6 @@ export function createOracleAgent(
       'Strategic technical advisor. Use for architecture decisions, complex debugging, code review, simplification, and engineering guidance.',
     config: {
       model,
-      temperature: 0.1,
       prompt,
     },
   };

@@ -6,17 +6,35 @@
  * of the user's actual turn.
  */
 import { PHASE_REMINDER } from '../../config/constants';
-import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils';
-import { isUserMessageWithParts } from '../types';
+import { isInternalInitiatorPart } from '../../utils';
+import {
+  appendTaggedSyntheticPart,
+  isTaggedPart,
+} from '../cache-safe-injection';
+import {
+  findLatestUserMessage,
+  isUserMessageWithParts,
+  type MessagePart,
+} from '../types';
 
 export { PHASE_REMINDER };
+
+export const PHASE_REMINDER_METADATA_KEY = 'oh-my-opencode-slim.phaseReminder';
+
+export function hasPhaseReminder(part: MessagePart): boolean {
+  return isTaggedPart(part, PHASE_REMINDER_METADATA_KEY);
+}
+
+interface PhaseReminderOptions {
+  shouldInject?: (sessionID: string) => boolean;
+}
 
 /**
  * Creates the experimental.chat.messages.transform hook for phase reminder injection.
  * This hook runs right before sending to API, so it doesn't affect UI display.
  * Only injects for the orchestrator agent.
  */
-export function createPhaseReminderHook() {
+export function createPhaseReminderHook(options: PhaseReminderOptions = {}) {
   return {
     'experimental.chat.messages.transform': async (
       _input: Record<string, never>,
@@ -24,57 +42,49 @@ export function createPhaseReminderHook() {
     ): Promise<void> => {
       const messages = Array.isArray(output.messages) ? output.messages : [];
 
-      if (messages.length === 0) {
+      const lastUserMessage = findLatestUserMessage(messages);
+      if (!lastUserMessage) {
         return;
       }
 
-      let lastUserMessageIndex = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (isUserMessageWithParts(messages[i])) {
-          lastUserMessageIndex = i;
-          break;
-        }
-      }
-
-      if (lastUserMessageIndex === -1) {
+      const { agent, sessionID } = lastUserMessage.info;
+      if (
+        agent !== 'orchestrator' ||
+        !sessionID ||
+        (options.shouldInject && !options.shouldInject(sessionID))
+      ) {
         return;
       }
 
-      const lastUserMessage = messages[lastUserMessageIndex];
-      if (!isUserMessageWithParts(lastUserMessage)) {
-        return;
-      }
-
-      const agent = lastUserMessage.info.agent;
-      if (agent && agent !== 'orchestrator') {
-        return;
-      }
-
-      const textPartIndex = lastUserMessage.parts.findIndex(
-        (p) => p.type === 'text' && p.text !== undefined,
-      );
-
-      if (textPartIndex === -1) {
-        return;
-      }
-
-      const originalText = lastUserMessage.parts[textPartIndex].text ?? '';
-      if (originalText.includes(SLIM_INTERNAL_INITIATOR_MARKER)) {
-        return;
-      }
-      // Prevent duplicate injection: check if any existing part already contains
-      // the phase reminder (either merged into text or as a standalone part).
-      if (lastUserMessage.parts.some((p) => p.text?.includes(PHASE_REMINDER))) {
-        return;
-      }
-
+      // post-file-tool-nudge must run first so its tagged part deduplicates.
       // Append reminder as a new, separate message part instead of mutating
       // the user-authored text. This prevents the reminder from leaking into
       // the UI display and chat history (issue #448).
-      lastUserMessage.parts.push({
-        type: 'text',
-        text: PHASE_REMINDER,
-      });
+      for (const message of messages) {
+        if (
+          !isUserMessageWithParts(message) ||
+          message.info.agent !== 'orchestrator' ||
+          message.info.sessionID !== sessionID
+        ) {
+          continue;
+        }
+
+        const textPart = message.parts.find(
+          (part) => part.type === 'text' && part.text !== undefined,
+        );
+        if (
+          !textPart ||
+          isInternalInitiatorPart(textPart) ||
+          message.parts.some(hasPhaseReminder)
+        ) {
+          continue;
+        }
+
+        appendTaggedSyntheticPart(message, {
+          text: PHASE_REMINDER,
+          metadataKey: PHASE_REMINDER_METADATA_KEY,
+        });
+      }
     },
   };
 }

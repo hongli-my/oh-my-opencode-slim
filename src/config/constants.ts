@@ -47,13 +47,14 @@ export const POLL_INTERVAL_BACKGROUND_MS = 2000;
 // Timeouts
 export const MAX_POLL_TIME_MS = 5 * 60 * 1000; // 5 minutes
 
-// Subagent depth limits
-export const DEFAULT_MAX_SUBAGENT_DEPTH = 3;
-
 // Workflow reminders
-export const PHASE_REMINDER_TEXT = `!IMPORTANT! Scheduler workflow: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. Do not poll running jobs, consume running-job output, or advance dependent work. !END!`;
+export const PHASE_REMINDER_TEXT = `!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!`;
 
-export const PHASE_REMINDER = `<internal_reminder>${PHASE_REMINDER_TEXT}</internal_reminder>`;
+export function formatSystemReminder(text: string): string {
+  return `<system-reminder>\n${text}\n</system-reminder>`;
+}
+
+export const PHASE_REMINDER = formatSystemReminder(PHASE_REMINDER_TEXT);
 
 export const WRITABLE_FILE_OPERATIONS_RULES = `**File Operations Rules**:
 - Prefer dedicated file tools for normal code work: glob/grep/ast_grep_search for discovery, read for file contents, and edit/write/apply_patch for targeted source changes.
@@ -73,15 +74,38 @@ export const NO_SHELL_READONLY_FILE_OPERATIONS_RULES = `**File Operations Rules*
 - Use glob/grep/ast_grep_search for discovery and read for file contents.
 - Do not use bash or shell commands.`;
 
-// Tmux pane spawn delay (ms) — gives TmuxSessionManager time to create pane
-export const TMUX_SPAWN_DELAY_MS = 500;
-
-// Stagger delay (ms) between parallel councillor launches to avoid tmux collisions
-export const COUNCILLOR_STAGGER_MS = 250;
-
 // Polling stability
 export const STABLE_POLLS_THRESHOLD = 3;
+
+// Toast duration (ms) used by all OMOS toasts
+export const TOAST_DURATION_MS = 10_000;
 
 /** Agents that are disabled by default. Users must explicitly enable them
  *  by removing from disabled_agents and configuring an appropriate model. */
 export const DEFAULT_DISABLED_AGENTS: string[] = ['observer'];
+
+// Background job defaults
+export const DEFAULT_MAX_SESSIONS_PER_AGENT = 2;
+export const DEFAULT_MAX_CONTEXT_LINES = 50_000;
+export const DEFAULT_READ_CONTEXT_MIN_LINES = 10;
+export const DEFAULT_READ_CONTEXT_MAX_FILES = 8;
+export const DEFAULT_MAX_RETAINED_SNAPSHOTS = 20;
+
+/**
+ * Maximum session metadata entries retained per plugin instance.
+ * Prevents unbounded growth when session.deleted events are missed.
+ * Oldest entries are evicted first when this threshold is reached.
+ */
+export const DEFAULT_MAX_SESSION_METADATA_ENTRIES = 1000;
+
+export type ImageRouting = 'auto' | 'direct';
+
+export function resolveImageRouting(
+  imageRouting: ImageRouting | undefined,
+  observerEnabled: boolean,
+): ImageRouting {
+  // Explicit value: use it
+  if (imageRouting !== undefined) return imageRouting;
+  // Legacy conditional: intercept only when observer is enabled
+  return observerEnabled ? 'auto' : 'direct';
+}

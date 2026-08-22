@@ -52,7 +52,6 @@ export function createExplorerAgent(
       "Fast codebase search and pattern matching. Use for finding files, locating code patterns, and answering 'where is X?' questions.",
     config: {
       model,
-      temperature: 0.1,
       prompt,
     },
   };

@@ -22,29 +22,31 @@
 
 </div>
 
----
-
 ## このプラグインについて
 
 oh-my-opencode-slim は OpenCode 向けのエージェントオーケストレーションプラグインです。コードベースの調査、最新ドキュメントの参照、アーキテクチャレビュー、UI 作業、スコープが明確な実装タスクの実行までを担う専門エージェントチームを、1 つのオーケストレーターの下に標準で備えています。
 
-コンセプトはシンプルです。1 つのモデルにすべてを押し付けるのではなく、各タスクに最適なエージェントへ作業を振り分けることで、**品質・速度・コスト**のバランスを取ります。
+コンセプトはシンプルです。1 つのモデルにすべてを押し付けるのではなく、各タスクに最適なエージェントへ作業を振り分けることで、**品質・速度・コスト**のバランスを取ります。Orchestrator は作業グラフを計画し、専門家をバックグラウンドタスクとして派遣し、結果を統合してから次に進みます。
 
-各エージェントについて知りたい場合は **[Meet the Pantheon](#meet-the-pantheon)** を参照してください。機能の全体像は下記の **[Features & Workflows](#features-and-workflows)** をご覧ください。
+### ✨ ハイライト
 
-### LazySkills でエージェントスキルを管理
+- **[7 つの専門エージェント](#meet-the-pantheon)** - Orchestrator、Explorer、Oracle、Council、Librarian、Designer、Fixer。各作業に最適なエージェントを割り当て、プロバイダーを問わず任意のモデルを組み合わせられます。
+- **[バックグラウンドオーケストレーション](docs/background-orchestration.md)** - Orchestrator が専門家をバックグラウンドタスクとして派遣・追跡し、続行前に結果を統合します。並列作業がデフォルトです。
+- **[同梱スキル](#skills)** - `deepwork`、`codemap`、`verification-planning`、`reflect` などのプロンプトベースのワークフローを、エージェントごとに割り当てます。
+- **[Council](docs/council.md)** - `@council` で同じ質問を複数モデルに並列で投げ、1 つの回答に統合します。
+- **[Companion](docs/companion.md)** - 並列のバックグラウンド専門家を含む、稼働中のエージェントを表示する任意のフローティングデスクトップウィンドウです。
+- **[マルチプレクサー統合](docs/multiplexer-integration.md)** - Tmux、Zellij、Herdr、cmux、kitty のペインでエージェントの作業をライブ表示します。
+- **[プリセット切り替え](docs/preset-switching.md)** - `/preset` でチーム全体のモデルを実行時に切り替えます。
+- **[コードインテリジェンスツール](docs/tools.md)** - 25 言語対応の LSP、AST 対応検索、ドキュメント・GitHub コード検索用の組み込み MCP を提供します。
+- **[完全にカスタマイズ可能](docs/configuration.md)** - カスタムエージェント、プロンプト上書き、エージェントごとのスキル/MCP 権限、[プロジェクトローカルのカスタマイズ](docs/project-local-customization.md)に対応します。
+
+### OpenAI GPT-5.6
 
 <p align="center">
-  <a href="https://github.com/alvinunreal/lazyskills">
-    <img src="img/lazyskills-wide.svg" alt="LazySkills" width="720">
-  </a>
+  <img src="img/openai-gpt-5-6-pantheon.jpeg" alt="OpenAI GPT-5.6 パンテオン：Terra、Sol、Luna" width="100%">
 </p>
 
-**[LazySkills](https://github.com/alvinunreal/lazyskills)** は、エージェントスキルを管理するためのターミナル UI です。インストール済みのスキル、各スキルを使用できるエージェント、可視性が壊れている理由、次に安全に実行できる操作を 1 か所で確認できます。
-
-<p align="center">
-  <a href="https://github.com/alvinunreal/lazyskills"><b>LazySkills を見る →</b></a>
-</p>
+デフォルトの [OpenAI プリセット](docs/openai-preset.md) は、Terra を Orchestrator、Sol を Oracle、Luna を高速な専門レーンに割り当てます。
 
 ### ユーザーの声
 
@@ -88,9 +90,36 @@ Install and configure oh-my-opencode-slim: https://raw.githubusercontent.com/alv
 bunx oh-my-opencode-slim@latest install
 ```
 
+### Master ブランチから実行
+
+最新コードを使いたい場合、バグ修正を試したい場合、またはローカルで
+開発・コントリビュートしたい場合はこちらを使ってください:
+
+```bash
+git clone https://github.com/alvinunreal/oh-my-opencode-slim.git ~/repos/oh-my-opencode-slim
+cd ~/repos/oh-my-opencode-slim
+bun install
+bun run build
+bun dist/cli/index.js install
+```
+
+インストーラーはローカルリポジトリのパスを
+`~/.config/opencode/opencode.json` の `plugin` 配列に追加するため、
+OpenCode はそのフォルダーからプラグインを読み込みます。後で更新するには:
+
+```bash
+cd ~/repos/oh-my-opencode-slim
+git pull
+bun install
+bun run build
+```
+
 ### はじめに
 
 インストーラーは OpenAI と OpenCode Go の両方のプリセットを生成し、デフォルトでは OpenAI が有効になります。
+
+> [!TIP]
+> モデルやエージェントは、自分のワークフローに合わせて自由に調整してください。デフォルトプリセットは出発点にすぎません。このプラグインは、深い柔軟性とカスタマイズ性を提供するために設計されています。
 
 インストール時に OpenCode Go を有効にするには、`bunx oh-my-opencode-slim@latest install --preset=opencode-go` を実行するか、インストール後に `~/.config/opencode/oh-my-opencode-slim.json` のデフォルトプリセット名を変更してください。
 
@@ -114,7 +143,7 @@ bunx oh-my-opencode-slim@latest install
 > バックグラウンドオーケストレーションの仕組みを理解しておくことを**推奨**します。**[Orchestrator のプロンプト](https://github.com/alvinunreal/oh-my-opencode-slim/blob/master/src/agents/orchestrator.ts#L28)** には、スケジューラーのルール、専門エージェントへのルーティングロジック、作業をバックグラウンドエージェントへ割り当てるしきい値が記述されています。`@agentName <task>` のようにサブエージェントを呼び出すことで、いつでも手動で委譲できます。
 
 > [!TIP]
-> バックグラウンドエージェントが現在のデフォルトワークフローになっているため、**[Multiplexer Integration](docs/multiplexer-integration.md)** を有効化して設定することを**強く推奨**します。各エージェントが専用の Tmux、Zellij または Herdr ペインで自動的に開かれるため、Orchestrator がセッションを調整し続けている間も、専門エージェントの作業をリアルタイムで追えます。
+> バックグラウンドエージェントが現在のデフォルトワークフローになっているため、**[Multiplexer Integration](docs/multiplexer-integration.md)** を有効化して設定することを**強く推奨**します。各エージェントが専用の Tmux、Zellij、Herdr、cmux、または kitty ペインで自動的に開かれるため、Orchestrator がセッションを調整し続けている間も、専門エージェントの作業をリアルタイムで追えます。
 
 デフォルトで生成される設定には `openai` と `opencode-go` の両方のプリセットが含まれます。
 
@@ -124,29 +153,37 @@ bunx oh-my-opencode-slim@latest install
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-5.5", "variant": "medium", "skills": ["*"], "mcps": ["*", "!context7"] },
-      "oracle": { "model": "openai/gpt-5.5", "variant": "high", "skills": ["simplify"], "mcps": [] },
-      "librarian": { "model": "openai/gpt-5.4-mini", "variant": "low", "skills": [], "mcps": ["websearch", "context7", "gh_grep"] },
-      "explorer": { "model": "openai/gpt-5.4-mini", "variant": "low", "skills": [], "mcps": [] },
-      "designer": { "model": "openai/gpt-5.4-mini", "variant": "medium", "skills": [], "mcps": [] },
-      "fixer": { "model": "openai/gpt-5.5", "variant": "low", "skills": [], "mcps": [] }
+      "orchestrator": { "model": "openai/gpt-5.6-terra", "variant": "high", "skills": ["*"], "mcps": ["*", "!context7"] },
+      "oracle": { "model": "openai/gpt-5.6-sol", "variant": "high", "skills": ["simplify"], "mcps": [] },
+      "librarian": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": ["context7", "gh_grep"] },
+      "explorer": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": [] },
+      "designer": { "model": "openai/gpt-5.6-luna", "variant": "medium", "skills": [], "mcps": [] },
+      "fixer": { "model": "openai/gpt-5.6-luna", "variant": "high", "skills": [], "mcps": [] }
     },
     "opencode-go": {
-      "orchestrator": { "model": "opencode-go/glm-5.1", "skills": [ "*" ], "mcps": [ "*", "!context7" ] },
-      "oracle": { "model": "opencode-go/deepseek-v4-pro", "variant": "max", "skills": ["simplify"], "mcps": [] },
-      "council": { "model": "opencode-go/deepseek-v4-pro", "variant": "high", "skills": [], "mcps": [] },
-      "librarian": { "model": "opencode-go/minimax-m2.7", "skills": [], "mcps": [ "websearch", "context7", "gh_grep" ] },
-      "explorer": { "model": "opencode-go/minimax-m2.7", "skills": [], "mcps": [] },
-      "designer": { "model": "opencode-go/kimi-k2.6", "variant": "medium", "skills": [], "mcps": [] },
-      "fixer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high", "skills": [], "mcps": [] }
+      "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
+      "oracle": { "model": "opencode-go/qwen3.7-max", "variant": "max" },
+      "librarian": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
+      "explorer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
+      "designer": { "model": "opencode-go/kimi-k2.7-code" },
+      "fixer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
+      "observer": { "model": "opencode-go/mimo-v2.5" }
     }
   }
 }
 ```
 
+### プリセットのドキュメント
+
+- **[OpenAI プリセット](docs/openai-preset.md)** — デフォルトで生成されるプリセット。すべてのエージェントを OpenAI モデルで実行します。
+- **[OpenCode Go プリセット](docs/opencode-go-preset.md)** — エージェントを OpenCode Go モデルで実行します。Orchestrator モデルがマルチモーダルでないため、視覚分析用に Observer エージェントを有効化します。
+- **[作者のプリセット](docs/authors-preset.md)** — 作者が日常的に使う、サードパーティスキルを含む正確な設定です。
+- **[$30 プリセット](docs/thirty-dollars-preset.md)** — Codex Plus と GitHub Copilot Pro を中心とした、月額約 $30 の混合プロバイダー構成です。
+- **[OpenCode Zen Free プリセット](docs/opencode-zen-free-preset.md)** — すべてのエージェントを opencode の無料モデルで実行し、利用コストはかかりません。
+
 ### 他のプロバイダーを利用する場合
 
-カスタムプロバイダーや複数プロバイダーを組み合わせた構成を使用するには、完全なリファレンスとして **[Configuration](docs/configuration.md)** を参照してください。すぐに使える出発点が欲しい場合は **[Author's Preset](docs/authors-preset.md)** と **[$30 Preset](docs/thirty-dollars-preset.md)** をご覧ください。`$30` プリセットはコスト効率に最も優れたセットアップです。
+カスタムプロバイダーや複数プロバイダーを組み合わせた構成を使用するには、完全なリファレンスとして **[Configuration](docs/configuration.md)** を参照してください。
 
 ### ✅ セットアップの確認
 
@@ -171,90 +208,6 @@ ping all agents
 
 ---
 
-### V2 の新機能
-
-V2 は oh-my-opencode-slim を、スケジューラー中心のマルチエージェントワークフローシステムへと進化させます。Orchestrator は計画、委譲、結果の整合、検証に集中し、専門エージェントはそれぞれの lane で作業を行います。
-
-- **[バックグラウンドエージェント](#バックグラウンドエージェント)** — Orchestrator は専門家をバックグラウンドタスクとしてディスパッチし、タスク/セッション ID を追跡し、完了イベントを待ってから結果を整合します。
-- **[Companion](#companion)** — 任意のフローティングデスクトップウィンドウが、並列実行中のバックグラウンド専門家を含め、現在アクティブなエージェントを表示します。
-- **[Deepwork](#deepwork)** — 大規模、多ファイル、高リスク、または段階的なコーディング作業向けの構造化ワークフローです。永続的な計画ファイルと Oracle レビューゲートを使用します。
-- **[Reflect](#reflect)** — 繰り返される作業パターンを振り返り、再利用可能な skill、エージェント、コマンド、設定ルール、プロンプトルール、プロジェクト playbook を提案します。
-- **[Worktrees](#worktrees)** — 複雑、高リスク、または並列タスク向けに、安全プロトコル付きの隔離されたコーディング lane として Git worktree を管理します。
-- **[oh-my-opencode-slim Skill](#oh-my-opencode-slim-skill)** — モデル、プロンプト、カスタムエージェント、MCP アクセス、プリセット、プラグイン動作を安全に調整するための同梱設定 skill です。
-
-#### バックグラウンドエージェント
-
-V2 では、バックグラウンド専門家が基本の考え方になります。Orchestrator は作業グラフを計画し、適切なエージェントを起動し、重複する書き込み所有権を避け、ターミナルタスクの結果を受け取ってから次の行動に進みます。
-
-完全なスケジューラーモデルは **[Background Orchestration](docs/v2-background-orchestration.md)** を参照してください。
-
-#### Companion
-
-任意の Companion は、リアルタイムのエージェント活動を表示するフローティングデスクトップステータスウィンドウです。現在のセッション状態とアクティブなエージェントを表示するため、バックグラウンド作業を一目で追いやすくなります。
-
-<div align="center">
-  <img src="img/companion.gif" alt="Companion showing active agents" width="600">
-  <p><i>左下のビジュアル Companion。</i></p>
-</div>
-
-対話式インストールでは、インストーラーが Companion を有効にするか尋ね、デフォルトは `no` です。自動化では明示的に有効化できます。
-
-```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
-```
-
-設定、位置、サイズ、インストール詳細は **[Companion](docs/companion.md)** を参照してください。
-
-#### Deepwork
-
-Deepwork は、大規模リファクタリング、多段階機能、高リスクなアーキテクチャ変更、または永続的な計画が必要な重いコーディングセッション向けです。ローカルの markdown 進捗ファイルを作成し、Oracle レビューゲートを使い、実装フェーズを構造化します。
-
-次のように開始します。
-
-```text
-/deepwork <heavy coding task>
-```
-
-いつ使うべきか、ワークフローがどのように動くかは **[Skills](docs/skills.md#deepwork)** を参照してください。
-
-#### Reflect
-
-Reflect は、Orchestrator が繰り返し発生するワークフロー上の摩擦から学ぶのを助けます。最近の作業と既存の資産を確認し、skill、カスタムエージェント、コマンド、設定ルール、プロンプトルール、MCP 権限変更、プロジェクト playbook の中から、最小で有用な改善を提案します。十分な証拠がない場合は、何も作成しないことを推奨します。
-
-直接実行できます。
-
-```text
-/reflect
-/reflect release workflow and checks
-```
-
-自然なプロンプトでも利用できます。
-
-```text
-reflect on my recent workflows
-find repeated work worth turning into reusable instructions
-```
-
-完全なワークフローとガードレールは **[Skills](docs/skills.md#reflect)** を参照してください。
-
-#### Worktrees
-
-Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔離されたコーディング lane として管理します。Orchestrator が lane のライフサイクルを管理し、`.slim/worktrees.json` に状態を記録し、専門エージェントを lane 内で実行し、Git の状態を変更する前に明示的な確認を求めます。
-
-安全プロトコルは **[Skills](docs/skills.md#worktrees)** を参照してください。
-
-#### oh-my-opencode-slim Skill
-
-同梱の `oh-my-opencode-slim` skill は、Orchestrator がプラグイン自体を設定・改善するのを支援します。モデル調整、カスタムエージェント、プロンプト上書き、skill/MCP 権限、プリセット、任意エージェント、バックグラウンドオーケストレーション、繰り返し発生するワークフロー上の摩擦に利用できます。
-
-<div align="center">
-  <img src="img/oh-my-opencode-skill.png" alt="oh-my-opencode-slim skill in use" width="600">
-  <p><i>同梱 skill にエージェント設定の調整と改善を依頼できます。</i></p>
-</div>
-
-例と安全ルールは **[Skills](docs/skills.md#oh-my-opencode-slim)** を参照してください。
-
----
 
 <a id="meet-the-pantheon"></a>
 
@@ -284,17 +237,17 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.5</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-terra (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.5</code> <code>anthropic/claude-opus-4.6</code>
+      <b>Recommended Models:</b> <code>openai/gpt-5.6-terra (medium)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Model Guidance:</b> デフォルトとして、総合力の最も高いコーディングモデルを選択してください。Orchestrator はメインのコーディングエージェントであると同時に委譲役でもあるため、強力な実装能力、優れた判断力、確実な指示遵守が求められます。
+      <b>Model Guidance:</b> 最も強力な計画・判断モデルを選んでください。Orchestrator はワークフローマネージャーです。作業を計画し、バックグラウンドの専門家をスケジュールし、結果を統合して成果を検証するため、単純なワーカーの処理量よりも、確実な指示遵守と高水準の技術的判断が必要です。
     </td>
   </tr>
 </table>
@@ -325,12 +278,12 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.4-mini</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo</code> <code>openai/gpt-5.4-mini</code>
+      <b>Recommended Models:</b> <code>openai/gpt-5.3-codex</code> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo</code>
     </td>
   </tr>
   <tr>
@@ -366,12 +319,12 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.5 (high)</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-sol (high)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.5 (high)</code> <code>google/gemini-3.1-pro-preview (high)</code>
+      <b>Recommended Models:</b> <code>openai/gpt-5.6-sol (xhigh)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8 (xhigh)</code>
     </td>
   </tr>
   <tr>
@@ -415,7 +368,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Setup:</b> <code>Config-driven</code> — 評議員（councillors）は <code>council.presets</code> から、Council エージェント自身のモデルは通常の <code>council</code> エージェント設定から決定されます
+      <b>Default Setup:</b> <code>Config-driven</code> - 評議員（councillors）は <code>council.presets</code> から、Council エージェント自身のモデルは通常の <code>council</code> エージェント設定から決定されます
     </td>
   </tr>
   <tr>
@@ -456,12 +409,12 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.4-mini</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo</code> <code>openai/gpt-5.4-mini</code>
+      <b>Recommended Models:</b> <code>openai/gpt-5.3-codex</code> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo</code>
     </td>
   </tr>
   <tr>
@@ -482,7 +435,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
       <br><sub><i>美は不可欠なもの。</i></sub>
     </td>
     <td width="70%" valign="top">
-      Designer は、美が重要であることを忘れがちな世界において、それを守り続ける不死の守護者です。これまでに無数のインターフェースが現れては消えるのを見届け、どれが人々の記憶に残り、どれが忘れ去られたかを知っています。すべてのピクセルに目的を、すべてのアニメーションに物語を、すべてのインタラクションに喜びを宿す——その神聖な責務を担います。美は選択肢ではなく、不可欠なものです。
+      Designer は、美が重要であることを忘れがちな世界において、それを守り続ける不死の守護者です。これまでに無数のインターフェースが現れては消えるのを見届け、どれが人々の記憶に残り、どれが忘れ去られたかを知っています。すべてのピクセルに目的を、すべてのアニメーションに物語を、すべてのインタラクションに喜びを宿す--その神聖な責務を担います。美は選択肢ではなく、不可欠なものです。
     </td>
   </tr>
   <tr>
@@ -497,12 +450,12 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.4-mini</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>google/gemini-3.1-pro-preview</code> <code>kimi-for-coding/k2p5</code> 
+      <b>Recommended Models:</b> <code>google/gemini-3.5-flash</code> <code>moonshotai/kimi-k2.7-code</code>
     </td>
   </tr>
   <tr>
@@ -523,7 +476,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
       <br><sub><i>構想と現実を結ぶ最後の一歩。</i></sub>
     </td>
     <td width="70%" valign="top">
-      Fixer は、かつてデジタル世界の礎を築き上げた建造者の系譜の最後のひとりです。計画と議論の時代が始まってもなお、彼らだけは残りました——実際に作る者として。思考をモノへと変え、仕様を実装へと転換する古の知恵を継承しています。Fixer は、構想と現実の間にある最後の一歩です。
+      Fixer は、かつてデジタル世界の礎を築き上げた建造者の系譜の最後のひとりです。計画と議論の時代が始まってもなお、彼らだけは残りました--実際に作る者として。思考をモノへと変え、仕様を実装へと転換する古の知恵を継承しています。Fixer は、構想と現実の間にある最後の一歩です。
     </td>
   </tr>
   <tr>
@@ -538,17 +491,17 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.4-mini</code>
+      <b>Default Model:</b> <code>openai/gpt-5.6-luna (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p5-turbo</code> <code>openai/gpt-5.4-mini</code>
+      <b>Recommended Models:</b> <code>openai/gpt-5.6-luna (medium)</code> <code>anthropic/claude-sonnet-4-6</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Model Guidance:</b> 定型的でスコープが明確な実装作業には、高速で信頼性の高いコーディングモデルを選びましょう。Fixer は通常、Orchestrator から具体的な計画や限定された指示を受け取るため、テスト・テスト更新・素直なコード変更といった効率重視の実行タスクに適しています。
+      <b>Model Guidance:</b> スコープが明確な実装作業には、信頼性の高いコーディングモデルを選びましょう。Fixer は Orchestrator から具体的な計画や限定された指示を受け取るため、効率的な実行タスクや素直なコード変更に適しています。
     </td>
   </tr>
 </table>
@@ -560,7 +513,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
 ### Observer: 沈黙の証人
 
 > [!NOTE]
-> **なぜ別エージェントとして用意されているのか？** Orchestrator のモデルがマルチモーダルでない場合、画像、スクリーンショット、PDF などのビジュアルファイルを扱うために Observer を有効にしてください。Observer はデフォルトでは無効ですが、メインの推論モデルを変更せずに Orchestrator に専用のマルチモーダルリーダーを提供できます。設定で `disabled_agents: []` と `observer` モデルを指定してください。同梱の `opencode-go` インストールプリセットでは、GLM Orchestrator がマルチモーダルでないため、これを自動的に行います。
+> **なぜ別エージェントとして用意されているのか？** Orchestrator のモデルがマルチモーダルでない場合、画像、スクリーンショット、その他のビジュアルファイルを扱うために Observer を有効にしてください。Observer はデフォルトでは無効ですが、メインの推論モデルを変更せずに Orchestrator に専用のマルチモーダルリーダーを提供できます。設定で `disabled_agents: []` と `observer` モデルを指定してください。同梱の `opencode-go` インストールプリセットでは、その Orchestrator がマルチモーダルでないため、これを自動的に行います。`image_routing` を省略すると既存の条件付き Observer 動作が維持されます。`"auto"` は Observer を有効にした場合のみ設定し、画像添付を常に Orchestrator に渡すには `"direct"` を設定してください。
 
 <table>
   <tr>
@@ -570,11 +523,11 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
     </td>
     <td width="70%" valign="top">
 
-**読み取り専用のビジュアル解析** — 画像、スクリーンショット、PDF、図解を解釈します。ファイルの生バイトをメインのコンテキストウィンドウに読み込ませることなく、構造化された観察結果をオーケストレーターに返します。
+**読み取り専用のビジュアル解析** - 画像、スクリーンショット、PDF、図解を解釈します。ファイルの生バイトをメインのコンテキストウィンドウに読み込ませることなく、構造化された観察結果をオーケストレーターに返します。
 
 - 画像、スクリーンショット、図解 → `read` ツール（ネイティブな画像サポート）
 - PDF やバイナリドキュメント → `read` ツール（テキスト＋構造抽出）
-- **デフォルトでは無効** — `"disabled_agents": []` を設定し、ビジョン対応モデルを構成することで有効化できます。`--preset=opencode-go` でインストールすると `opencode-go/kimi-k2.6` で有効になります
+- **デフォルトでは無効** - `"disabled_agents": []` を設定し、ビジョン対応モデルを構成することで有効化できます。`--preset=opencode-go` でインストールすると `opencode-go/mimo-v2.5` で有効になります。有効時、画像添付はデフォルトで Observer にルーティングされます。`"image_routing": "direct"` を設定すると Orchestrator に渡し続けます。
 
     </td>
   </tr>
@@ -585,7 +538,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.4-mini</code> — <i>有効化するにはビジョン対応モデルを設定してください</i>
+      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code> - <i>有効化するにはビジョン対応モデルを設定してください</i>
     </td>
   </tr>
   <tr>
@@ -594,6 +547,50 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
     </td>
   </tr>
 </table>
+
+---
+
+<a id="skills"></a>
+
+## 🧩 スキル
+
+スキルは、意思決定・ワークフロー・ツール使用を導くためにエージェントのシステムプロンプトへ注入される、プロンプトベースの指示です。実行中のサーバーである MCP とは異なり、スキルはプロセスを起動しません。必要に応じてエージェントが有効化する、目的に特化したプレイブックです。インストーラーは 8 個のスキルを同梱し、プラグインの自動更新時に更新します。ローカルでのカスタマイズは維持されます。
+
+| スキル | 目的 | デフォルトのエージェント | 呼び出し方 |
+|:-----:|---------|---------------|---------------|
+| <img src="img/skills/codemap.webp" width="120" alt="Codemap artifact"><br>[`codemap`](src/skills/codemap/SKILL.md) | エージェントが全体を再読せずにコードベースを理解するための階層的リポジトリマップ | `orchestrator` | `run codemap` |
+| <img src="img/skills/deepwork.webp" width="120" alt="Deepwork artifact"><br>[`deepwork`](src/skills/deepwork/SKILL.md) | レビューゲートを備えた、大規模・高リスク・複数フェーズのコーディングセッション用の構造化ワークフロー | `orchestrator` | `/deepwork <task>` |
+| <img src="img/skills/verification-planning.webp" width="120" alt="Verification Planning artifact"><br>[`verification-planning`](src/skills/verification-planning/SKILL.md) | 自明でない変更の前に、プロジェクト固有の証拠経路を計画 | `orchestrator` | 自明でない作業の前に自動実行 |
+| <img src="img/skills/simplify.webp" width="120" alt="Simplify artifact"><br>[`simplify`](src/skills/simplify/SKILL.md) | 可読性と保守性のための、振る舞いを変えない簡素化 | `oracle` | 簡素化を依頼するか、レビュー中に使用 |
+| <img src="img/skills/worktrees.webp" width="120" alt="Worktrees artifact"><br>[`worktrees`](src/skills/worktrees/SKILL.md) | リスクのある作業や並列作業のための、安全で隔離されたコーディングレーンとしての Git worktree | `orchestrator` | `work in a worktree` |
+| <img src="img/skills/clonedeps.webp" width="120" alt="Clonedeps artifact"><br>[`clonedeps`](src/skills/clonedeps/SKILL.md) | エージェントがライブラリ内部を調査できるよう、依存関係のソースをローカルにクローン | `orchestrator` | `clone dependencies` |
+| <img src="img/skills/reflect.webp" width="120" alt="Reflect artifact"><br>[`reflect`](src/skills/reflect/SKILL.md) | 繰り返すワークフローの摩擦を、再利用可能なスキル・エージェント・設定へ変換 | `orchestrator` | `/reflect` |
+| <img src="img/skills/oh-my-opencode-slim.webp" width="120" alt="oh-my-opencode-slim artifact"><br>[`oh-my-opencode-slim`](src/skills/oh-my-opencode-slim/SKILL.md) | プラグイン設定自体を安全に構成・改善 | `orchestrator` | セットアップの調整を依頼 |
+
+スキルの割り当ては権限付与です。エージェントが有効化できるのは、割り当てられたスキルだけです。`~/.config/opencode/oh-my-opencode-slim.json` のエージェントごとの `skills` 配列で設定します。明示的なリスト、すべてを許可する `"*"`、または 1 つを拒否する `"!skill-name"` を使えます。
+
+詳細は **[Skills](docs/skills.md)**、イラスト付きの概要は **[ohmyopencodeslim.com/skills](https://ohmyopencodeslim.com/skills)** をご覧ください。
+
+---
+
+<a id="companion"></a>
+
+## 🖥️ Companion
+
+任意の Companion は、ライブのエージェント活動を表示するフローティングデスクトップステータスウィンドウです。現在のセッション状態と稼働中のエージェントを表示するため、バックグラウンド作業を一目で追いやすくなります。
+
+<div align="center">
+  <img src="img/companion.gif" alt="Companion showing active agents" width="600">
+  <p><i>左下のビジュアル Companion。</i></p>
+</div>
+
+対話式インストールでは、インストーラーが Companion を有効にするか尋ね、デフォルトは `no` です。自動化では明示的に有効化できます:
+
+```bash
+bunx oh-my-opencode-slim@latest install --companion=yes
+```
+
+設定、位置、サイズ、インストール詳細は **[Companion](docs/companion.md)** を参照してください。
 
 ---
 
@@ -610,7 +607,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
 | **[Council](docs/council.md)** | 複数のモデルを並列実行し、`@council` で 1 つの回答に統合します |
 | **[Custom Agents](docs/configuration.md#custom-agents)** | カスタムプロンプト、モデル、MCP アクセス、Orchestrator の委譲ルールを備えた独自の専門エージェントを定義します |
 | **[ACP Agents](docs/acp-agents.md)** | Claude Code ACP や Gemini ACP などの外部 ACP 互換エージェントを委譲可能なサブエージェントとして接続します |
-| **[Multiplexer Integration](docs/multiplexer-integration.md)** | エージェントの動作を Tmux、Zellij や Herdr のペインでライブ表示します |
+| **[Multiplexer Integration](docs/multiplexer-integration.md)** | エージェントの動作を Tmux、Zellij、Herdr、cmux、や kitty のペインでライブ表示します |
 | **[Codemap](docs/codemap.md)** | 階層的なコードマップを生成し、大規模コードベースを迅速に理解します |
 | **[Clonedeps](docs/clonedeps.md)** | 選択した依存関係のソースを ignore 済みのローカルワークスペースにクローンし、調査できるようにします |
 | **[Worktrees](docs/worktrees.md)** | `.slim/worktrees/` lane を使い、隔離された並列または高リスクなコーディング作業を行います |
@@ -624,10 +621,11 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
 |-----|----------------|
 | **[Installation Guide](docs/installation.md)** | プラグインのインストール、CLI フラグの使用、設定のリセット、セットアップのトラブルシューティング |
 | **[Configuration](docs/configuration.md)** | 設定ファイルの配置場所、JSONC サポート、プロンプトの上書き、全オプションのリファレンス |
+| **[Project Customization](docs/project-local-customization.md)** | リポジトリ固有のカスタムエージェント、プロンプト上書き、エージェントごとのスキル、および優先順位 |
 | **[Background Orchestration](docs/background-orchestration.md)** | ネイティブのバックグラウンドサブエージェントを中心にした、スケジューラー優先の Orchestrator モデル |
 | **[Maintainer Guide](docs/maintainers.md)** | Issue のトリアージルール、ラベルの意味、サポートの振り分け、リポジトリ運用ワークフロー |
-| **[Skills](docs/skills.md)** | `simplify`、`codemap`、`clonedeps`、`deepwork`、`reflect`、`worktrees`、`oh-my-opencode-slim` などの同梱スキル |
-| **[MCPs](docs/mcps.md)** | `websearch`、`context7`、`gh_grep`、およびエージェントごとの MCP 権限の仕組み |
+| **[Skills](docs/skills.md)** | `simplify`、`codemap`、`clonedeps`、`deepwork`、`verification-planning`、`reflect`、`worktrees`、`oh-my-opencode-slim` などの同梱スキル |
+| **[MCPs](docs/mcps.md)** | `context7`、`gh_grep`、およびエージェントごとの MCP 権限の仕組み |
 | **[Tools](docs/tools.md)** | `webfetch`、LSP ツール、コード検索、フォーマッターなどの組み込みツール機能 |
 
 ### 💡 プリセット
@@ -647,7 +645,7 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
   <p><sub>マージされたすべての貢献は、この世界に痕跡を残します。</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-59-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-76-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -736,6 +734,29 @@ Worktrees は、Git worktree を `.slim/worktrees/<slug>/` 配下の安全で隔
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/Qesire"><img src="https://avatars.githubusercontent.com/u/102657430?v=4?s=100" width="100px;" alt="Knowingthesea_Qesire"/><br /><sub><b>Knowingthesea_Qesire</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Qesire" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="http://www.flyinghail.net/"><img src="https://avatars.githubusercontent.com/u/157430?v=4?s=100" width="100px;" alt="FENG Hao"/><br /><sub><b>FENG Hao</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=flyinghail" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/smatheusblu"><img src="https://avatars.githubusercontent.com/u/5666794?v=4?s=100" width="100px;" alt="Matheus Nogueira Silveira"/><br /><sub><b>Matheus Nogueira Silveira</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=smatheusblu" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/sktr"><img src="https://avatars.githubusercontent.com/u/44969514?v=4?s=100" width="100px;" alt="sktr"/><br /><sub><b>sktr</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=sktr" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/bobbyunknown"><img src="https://avatars.githubusercontent.com/u/62272380?v=4?s=100" width="100px;" alt="Insomnia"/><br /><sub><b>Insomnia</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=bobbyunknown" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/andrescastane"><img src="https://avatars.githubusercontent.com/u/13487870?v=4?s=100" width="100px;" alt="Andres Castañeda"/><br /><sub><b>Andres Castañeda</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=andrescastane" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://zaradacht.com/"><img src="https://avatars.githubusercontent.com/u/24251016?v=4?s=100" width="100px;" alt="Zaradacht Taifour (Zack)"/><br /><sub><b>Zaradacht Taifour (Zack)</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Zaradacht" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/fslse"><img src="https://avatars.githubusercontent.com/u/90545544?v=4?s=100" width="100px;" alt="fslse"/><br /><sub><b>fslse</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=fslse" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/linze0721"><img src="https://avatars.githubusercontent.com/u/178997622?v=4?s=100" width="100px;" alt="萧瑟"/><br /><sub><b>萧瑟</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=linze0721" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/SisyphusZheng"><img src="https://avatars.githubusercontent.com/u/146103794?v=4?s=100" width="100px;" alt="Zhi"/><br /><sub><b>Zhi</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=SisyphusZheng" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/824156793"><img src="https://avatars.githubusercontent.com/u/19755784?v=4?s=100" width="100px;" alt="lilili"/><br /><sub><b>lilili</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=824156793" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="http://mikehenke.com/"><img src="https://avatars.githubusercontent.com/u/119844?v=4?s=100" width="100px;" alt="Mike Henke"/><br /><sub><b>Mike Henke</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=mhenke" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/imVinayPandya"><img src="https://avatars.githubusercontent.com/u/5011197?v=4?s=100" width="100px;" alt="Vinay Pandya"/><br /><sub><b>Vinay Pandya</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=imVinayPandya" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/s-shank"><img src="https://avatars.githubusercontent.com/u/241541918?v=4?s=100" width="100px;" alt="Shank"/><br /><sub><b>Shank</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=s-shank" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://rgutzen.github.io/"><img src="https://avatars.githubusercontent.com/u/16289604?v=4?s=100" width="100px;" alt="Robin Gutzen"/><br /><sub><b>Robin Gutzen</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=rgutzen" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/dragon-Elec"><img src="https://avatars.githubusercontent.com/u/197374270?v=4?s=100" width="100px;" alt="Yash"/><br /><sub><b>Yash</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=dragon-Elec" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/Jiajun0413"><img src="https://avatars.githubusercontent.com/u/184531967?v=4?s=100" width="100px;" alt="Liu Jiajun"/><br /><sub><b>Liu Jiajun</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Jiajun0413" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/umi008"><img src="https://avatars.githubusercontent.com/u/200843810?v=4?s=100" width="100px;" alt="Ulises Millán"/><br /><sub><b>Ulises Millán</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=umi008" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/HighColdHC"><img src="https://avatars.githubusercontent.com/u/35870222?v=4?s=100" width="100px;" alt="HighColdHC"/><br /><sub><b>HighColdHC</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=HighColdHC" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://hardcore.engineer/about"><img src="https://avatars.githubusercontent.com/u/401815?v=4?s=100" width="100px;" alt="Stephan Schielke"/><br /><sub><b>Stephan Schielke</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=stephanschielke" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

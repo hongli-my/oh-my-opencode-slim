@@ -5,14 +5,13 @@ Multi-model consensus for cases where you want more than one model's judgment.
 ## Table of Contents
 
 - [Overview](#overview)
-- [The Important Mental Model](#the-important-mental-model)
 - [Quick Setup](#quick-setup)
 - [Configuration](#configuration)
+- [Model Fallback Chain](#model-fallback-chain)
 - [Choosing the Council Model vs Councillor Models](#choosing-the-council-model-vs-councillor-models)
 - [Preset Examples](#preset-examples)
 - [Role Prompts](#role-prompts)
 - [Usage](#usage)
-- [Timeouts, Retries, and Failures](#timeouts-retries-and-failures)
 - [Compatibility Notes](#compatibility-notes)
 - [Troubleshooting](#troubleshooting)
 
@@ -20,8 +19,8 @@ Multi-model consensus for cases where you want more than one model's judgment.
 
 ## Overview
 
-The **Council agent** runs several **councillors** in parallel, then the
-**Council agent itself** synthesizes their outputs into one answer.
+The **Council agent** runs several **councillors** in parallel, then
+synthesizes their outputs into one answer.
 
 ### What you get
 
@@ -32,15 +31,21 @@ The **Council agent** runs several **councillors** in parallel, then the
 
 ### How it works
 
+Each councillor in a preset is registered as a dynamic subagent named
+`councillor-<name>` (e.g. `councillor-alpha`, `councillor-beta`), each
+with its own configured model. The orchestrator dispatches all councillors
+in parallel via OpenCode's native `task()` tool at depth 1, and each
+councillor appears as its own TUI pane.
+
 ```text
 User / Orchestrator
         |
         v
 Council agent (@council, your configured synthesizer model)
         |
-        +--> launches Councillor A (preset model)
-        +--> launches Councillor B (preset model)
-        +--> launches Councillor C (preset model)
+        +--> task(): councillor-alpha (configured model)
+        +--> task(): councillor-beta  (configured model)
+        +--> task(): councillor-gamma (configured model)
         |
         v
 Council agent synthesizes councillor results
@@ -49,26 +54,8 @@ Council agent synthesizes councillor results
 Final answer
 ```
 
----
-
-## The Important Mental Model
-
-There are **two separate model layers**:
-
-1. **The Council agent model**
-   - This is the model behind `@council` itself.
-   - It does the final synthesis.
-   - Configure it like any other agent: via your active preset's `council`
-     entry or `agents.council` override.
-
-2. **The councillor models**
-   - These are the models that actually fan out in parallel.
-   - Configure them under `council.presets.<preset>.<councillor>.model`.
-
-If you only remember one thing, remember this:
-
-> `@council` uses the normal agent config for the synthesizer model, and
-> `council.presets` for the fan-out councillor models.
+The council agent waits for all councillors to respond (or fail), then
+synthesizes their results into a single report.
 
 ---
 
@@ -83,13 +70,13 @@ Add a council model and at least one council preset to your plugin config:
   "preset": "openai",
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.5" }
+      "council": { "model": "openai/gpt-5.6" }
     }
   },
   "council": {
     "presets": {
       "default": {
-        "alpha": { "model": "openai/gpt-5.4-mini" },
+        "alpha": { "model": "openai/gpt-5.6-luna" },
         "beta": { "model": "google/gemini-3-pro" },
         "gamma": { "model": "openai/gpt-5.3-codex" }
       }
@@ -114,12 +101,10 @@ Then use it directly:
 {
   "council": {
     "default_preset": "default",
-    "timeout": 180000,
-    "councillor_execution_mode": "parallel",
-    "councillor_retries": 3,
+
     "presets": {
       "default": {
-        "alpha": { "model": "openai/gpt-5.4-mini" }
+        "alpha": { "model": "openai/gpt-5.6-luna" }
       }
     }
   }
@@ -128,11 +113,8 @@ Then use it directly:
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `presets` | object | — | **Required.** Named councillor presets |
+| `presets` | object | - | **Required.** Named councillor presets |
 | `default_preset` | string | `"default"` | Preset used when none is specified |
-| `timeout` | number | `180000` | Per-councillor timeout in ms |
-| `councillor_execution_mode` | string | `"parallel"` | `parallel` runs all councillors concurrently; `serial` runs them one at a time |
-| `councillor_retries` | number | `3` | Retries per councillor on empty provider responses |
 
 ### Councillor config
 
@@ -140,11 +122,11 @@ Each entry inside a preset is one councillor:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `model` | string | Yes | Model ID in `provider/model` format |
-| `variant` | string | No | Optional variant/reasoning setting |
+| `model` | string \| array | Yes | A `provider/model` string, or an ordered fallback chain tried until one responds |
+| `variant` | string | No | Optional variant/reasoning setting (applies to chain entries without their own) |
 | `prompt` | string | No | Optional role guidance prepended to the user prompt |
 
-### Council agent config
+### Council agent (synthesizer) config
 
 The **synthesizer model** is **not** configured inside `council.presets`.
 
@@ -154,7 +136,7 @@ Configure it using the normal agent system:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.5", "variant": "high" }
+      "council": { "model": "openai/gpt-5.6", "variant": "high" }
     }
   }
 }
@@ -174,7 +156,46 @@ Or with a global override:
 
 ---
 
+## Model Fallback Chain
+
+When `model` is a string, the councillor uses that single model.
+
+When `model` is an array, the councillor walks the chain in order:
+
+```jsonc
+{
+  "council": {
+    "presets": {
+      "review": {
+        "reviewer": {
+          "model": [
+            "openai/gpt-5.6",
+            { "id": "google/gemini-3-pro", "variant": "high" },
+            "anthropic/claude-opus-4-6"
+          ],
+          "prompt": "Focus on bugs, edge cases, and failure modes."
+        }
+      }
+    }
+  }
+}
+```
+
+Entries are `provider/model` strings or `{ "id", "variant" }` objects. The
+councillor tries each entry in order until one responds. Empty responses are
+retried once per entry; other failures advance to the next entry. The
+councillor only fails once every entry in the chain is exhausted.
+
+---
+
 ## Choosing the Council Model vs Councillor Models
+
+There are **two separate model layers**:
+
+1. **The Council agent model** — the model behind `@council` itself, which
+   does the final synthesis.
+2. **The councillor models** — the models that actually fan out in parallel,
+   configured under `council.presets.<preset>.<councillor>.model`.
 
 ### Configure the Council agent when you want to change
 
@@ -206,13 +227,13 @@ Councillor models always come from:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.5" }
+      "council": { "model": "openai/gpt-5.6" }
     }
   },
   "council": {
     "presets": {
       "second-opinion": {
-        "reviewer": { "model": "openai/gpt-5.4-mini" }
+        "reviewer": { "model": "openai/gpt-5.6-luna" }
       }
     }
   }
@@ -225,14 +246,14 @@ Councillor models always come from:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.5" }
+      "council": { "model": "openai/gpt-5.6" }
     }
   },
   "council": {
     "default_preset": "balanced",
     "presets": {
       "balanced": {
-        "alpha": { "model": "openai/gpt-5.4-mini" },
+        "alpha": { "model": "openai/gpt-5.6-luna" },
         "beta": { "model": "google/gemini-3-pro" },
         "gamma": { "model": "anthropic/claude-opus-4-6" }
       }
@@ -240,25 +261,6 @@ Councillor models always come from:
   }
 }
 ```
-
-### Serial mode for single-model systems
-
-```jsonc
-{
-  "council": {
-    "councillor_execution_mode": "serial",
-    "presets": {
-      "default": {
-        "alpha": { "model": "openai/gpt-5.4-mini" },
-        "beta": { "model": "openai/gpt-5.4-mini" }
-      }
-    }
-  }
-}
-```
-
-Use `serial` when parallel councillor launches would contend for the same
-underlying provider/session limits.
 
 ---
 
@@ -272,7 +274,7 @@ Each councillor can receive its own steering prompt:
     "presets": {
       "review-board": {
         "reviewer": {
-          "model": "openai/gpt-5.4-mini",
+          "model": "openai/gpt-5.6-luna",
           "prompt": "Focus on bugs, edge cases, and failure modes."
         },
         "architect": {
@@ -301,56 +303,38 @@ The councillor sees:
 
 ## Usage
 
-### Direct invocation
+### Invocation
 
 ```text
 @council Should we use a job queue or an outbox pattern here?
 ```
 
-### Via orchestrator delegation
+The orchestrator may also delegate to `@council` for high-stakes or
+ambiguous decisions.
 
-The orchestrator may delegate to `@council` for high-stakes or ambiguous
-decisions, but it does so sparingly because council is usually the most
-expensive path.
+### What you see
 
-### Output format
+Each councillor appears as its own TUI pane, dispatched in parallel. As they
+complete, their responses stream into the panes. Once all councillors have
+responded (or failed), the council agent synthesizes their results.
+
+### Output
 
 Council responses include:
 
-1. `Council Response` — the synthesized final answer.
-2. `Councillor Details` — each responding councillor's individual response,
+1. **Council Response** — the synthesized final answer.
+2. **Per-Councillor Details** — each responding councillor's individual response,
    using the councillor names from the configured preset.
-3. `Council Summary` — agreement, disagreement resolution, remaining
+3. **Council Summary** — agreement, disagreement resolution, remaining
    uncertainty, and a consensus confidence rating of `unanimous`, `majority`,
    or `split`.
 
-### Output footer
-
-Council responses include a footer like:
+A footer tracks participation:
 
 ```text
 ---
-*Council: 2/3 councillors responded (alpha: gpt-5.4-mini, beta: gemini-3-pro)*
+*Council: 2/3 councillors responded (alpha: gpt-5.6-luna, beta: gemini-3-pro)*
 ```
-
----
-
-## Timeouts, Retries, and Failures
-
-### Timeout behavior
-
-- `timeout` is **per councillor**
-- timed-out councillors are marked `timed_out`
-- council still synthesizes from successful results
-
-### Empty response retries
-
-Some providers silently return zero tokens. Council treats that as a retryable
-failure.
-
-- `councillor_retries` defaults to `3`
-- retries only happen for **empty provider responses**
-- normal failures and timeouts are returned immediately
 
 ### Failure behavior
 
@@ -364,23 +348,11 @@ failure.
 
 ## Compatibility Notes
 
-### Deprecated `master` fields
+### Removed `master` fields
 
-Older examples used these fields:
-
-- `council.master`
-- `council.master_timeout`
-- `council.master_fallback`
-
-They are deprecated.
-
-Current behavior:
-
-- `master_timeout` is ignored
-- `master_fallback` is ignored
-- `master` is deprecated, but `master.model` is still accepted as a temporary
-  fallback for the **Council agent model only** when no explicit `council`
-  agent model is configured elsewhere
+The `council.master` field and other `master`-prefixed fields have been
+removed. A deprecation warning is logged this release if a config still
+contains them, but they no longer have any effect.
 
 Prefer this instead:
 
@@ -388,7 +360,7 @@ Prefer this instead:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.5" }
+      "council": { "model": "openai/gpt-5.6" }
     }
   }
 }
@@ -406,7 +378,7 @@ Prefer this instead:
 
 ### `@council` is missing
 
-Council tools are only registered when `config.council` exists.
+Council is only available when `config.council` exists.
 
 Make sure your config includes a `council` block with at least one preset.
 
@@ -418,20 +390,8 @@ Check:
 2. it exists under `council.presets`
 3. `default_preset` points to a real preset when omitted at runtime
 
-### All councillors timed out
+### All councillors fail
 
-Try:
-
-```jsonc
-{
-  "council": {
-    "timeout": 300000
-  }
-}
-```
-
-Also verify the configured model IDs exist in your OpenCode environment.
-
-### Subagent depth exceeded
-
-Council is meant to be a leaf agent. Avoid recursive council chains.
+Verify the configured model IDs exist in your OpenCode environment. Each
+councillor model must be a valid `provider/model` identifier your OpenCode
+setup can reach.

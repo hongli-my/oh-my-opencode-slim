@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
+import { fileURLToPath } from 'node:url';
+import { syncBundledSkillsFromPackage } from '../hooks/auto-update-checker/skill-sync';
 import {
   detectBackgroundSubagentsTarget,
   expandHomePath,
@@ -22,7 +24,7 @@ import {
   warmOpenCodePluginCache,
   writeLiteConfig,
 } from './config-manager';
-import { CUSTOM_SKILLS, installCustomSkill } from './custom-skills';
+import { CUSTOM_SKILLS } from './custom-skills';
 import { getExistingLiteConfigPath } from './paths';
 import type { ConfigMergeResult, InstallArgs, InstallConfig } from './types';
 
@@ -124,15 +126,32 @@ async function checkOpenCodeInstalled(): Promise<{
 }> {
   const installed = await isOpenCodeInstalled();
   if (!installed) {
+    const isWindows = process.platform === 'win32';
     printError('OpenCode is not installed on this system.');
     printInfo('Install it with:');
-    console.log(
-      `     ${BLUE}curl -fsSL https://opencode.ai/install | bash${RESET}`,
-    );
-    console.log();
-    printInfo('Or if already installed, add it to your PATH:');
-    console.log(`     ${BLUE}export PATH="$HOME/.local/bin:$PATH"${RESET}`);
-    console.log(`     ${BLUE}export PATH="$HOME/.opencode/bin:$PATH"${RESET}`);
+    if (isWindows) {
+      console.log(
+        `     ${BLUE}powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://opencode.ai/install.ps1 | iex"${RESET}`,
+      );
+      console.log();
+      printInfo('Or with winget:');
+      console.log(`     ${BLUE}winget install opencode${RESET}`);
+      console.log();
+      printInfo('Or if already installed, add it to your PATH:');
+      console.log(
+        `     ${BLUE}setx PATH "%PATH%;%LOCALAPPDATA%\\Programs\\opencode"${RESET}`,
+      );
+    } else {
+      console.log(
+        `     ${BLUE}curl -fsSL https://opencode.ai/install | bash${RESET}`,
+      );
+      console.log();
+      printInfo('Or if already installed, add it to your PATH:');
+      console.log(`     ${BLUE}export PATH="$HOME/.local/bin:$PATH"${RESET}`);
+      console.log(
+        `     ${BLUE}export PATH="$HOME/.opencode/bin:$PATH"${RESET}`,
+      );
+    }
     return { ok: false };
   }
   const version = await getOpenCodeVersion();
@@ -146,13 +165,15 @@ async function checkOpenCodeInstalled(): Promise<{
 export async function configureBackgroundSubagents(
   config: InstallConfig,
 ): Promise<{ enabledNow: boolean; configuredTarget?: string }> {
-  if (
-    isBackgroundSubagentsEnabled(
-      process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS,
-    )
-  ) {
+  const backgroundSubagentsEnabled = isBackgroundSubagentsEnabled(
+    process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS,
+  );
+  const exaEnabled = ['true', '1'].includes(
+    process.env.OPENCODE_ENABLE_EXA?.toLowerCase() ?? '',
+  );
+  if (backgroundSubagentsEnabled && exaEnabled) {
     printSuccess(
-      'OpenCode background subagents already enabled in environment',
+      'OpenCode background subagents and Exa websearch already enabled in environment',
     );
     return { enabledNow: true };
   }
@@ -199,10 +220,10 @@ export async function configureBackgroundSubagents(
       'V2 requires OpenCode background subagents for default orchestration.',
     );
     printInfo(
-      `The installer can add the required environment export to ${target}.`,
+      `The installer can add the required environment exports to ${target}.`,
     );
     const shouldWrite = await confirm(
-      'Add OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true now?',
+      'Enable background subagents and Exa websearch now?',
       true,
     );
     if (!shouldWrite) {
@@ -225,7 +246,7 @@ export async function configureBackgroundSubagents(
   }
 
   printSuccess(
-    `Background subagents enabled ${SYMBOLS.arrow} ${DIM}${target}${RESET}`,
+    `Background subagents and Exa websearch enabled ${SYMBOLS.arrow} ${DIM}${target}${RESET}`,
   );
   return { enabledNow: false, configuredTarget: target };
 }
@@ -410,27 +431,79 @@ async function runInstall(config: InstallConfig): Promise<number> {
 
   // Install custom skills if requested
   if (config.installCustomSkills) {
-    printStep(step++, totalSteps, 'Installing custom skills...');
+    printStep(step++, totalSteps, 'Synchronizing custom skills...');
     if (config.dryRun) {
-      printInfo('Dry run mode - would install custom skills:');
+      printInfo('Dry run mode - would synchronize custom skills:');
       for (const skill of CUSTOM_SKILLS) {
         printInfo(`  - ${skill.name}`);
       }
     } else {
-      let customSkillsInstalled = 0;
-      for (const skill of CUSTOM_SKILLS) {
-        printInfo(`Installing ${skill.name}...`);
-        if (installCustomSkill(skill)) {
-          printSuccess(`Installed: ${skill.name}`);
-          customSkillsInstalled++;
-        } else {
-          printInfo(`Skipped: ${skill.name} (already installed)`);
+      try {
+        const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
+        const result = syncBundledSkillsFromPackage(packageRoot, {
+          force: config.forceSkillSync,
+        });
+        const categorizedSkipped = new Set([
+          ...result.staged,
+          ...result.adopted,
+          ...result.customized,
+        ]);
+        const preservedSkills = result.skippedExisting.filter(
+          (skill) => !categorizedSkipped.has(skill),
+        );
+
+        if (result.installed.length > 0) {
+          for (const skill of result.installed) {
+            printSuccess(`Installed/Updated: ${skill}`);
+          }
         }
+        if (preservedSkills.length > 0) {
+          for (const skill of preservedSkills) {
+            printInfo(`Skipped/Preserved: ${skill}`);
+          }
+        }
+        if (result.failed.length > 0) {
+          for (const skill of result.failed) {
+            if (skill === '__lock__') {
+              printError('Lock acquisition failed');
+            } else if (skill === '__manifest__') {
+              printError('Manifest write failed');
+            } else {
+              printError(`Failed: ${skill}`);
+            }
+          }
+        }
+        if (result.staged.length > 0) {
+          for (const skill of result.staged) {
+            printInfo(`Staged for review: ${skill}`);
+          }
+        }
+        if (result.adopted.length > 0) {
+          for (const skill of result.adopted) {
+            printInfo(`Adopted: ${skill}`);
+          }
+        }
+        if (result.customized.length > 0) {
+          for (const skill of result.customized) {
+            printInfo(`Customized: ${skill}`);
+          }
+        }
+
+        const realFailed = result.failed.filter(
+          (skill) => skill !== '__lock__' && skill !== '__manifest__',
+        );
+        printSuccess(
+          `Skill synchronization complete: ` +
+            `${result.installed.length} installed/updated, ` +
+            `${preservedSkills.length} skipped/preserved, ` +
+            `${result.staged.length} staged, ` +
+            `${result.adopted.length} adopted, ` +
+            `${result.customized.length} customized, ` +
+            `${realFailed.length} failed.`,
+        );
+      } catch (err) {
+        printError(`Failed to synchronize custom skills: ${err}`);
       }
-      const totalCustom = CUSTOM_SKILLS.length;
-      printSuccess(
-        `${customSkillsInstalled}/${totalCustom} custom skills processed`,
-      );
     }
   }
 
@@ -466,7 +539,7 @@ async function runInstall(config: InstallConfig): Promise<number> {
     );
   } else {
     console.log(
-      `     ${BLUE}$ OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true opencode${RESET}`,
+      `     ${BLUE}$ OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true OPENCODE_ENABLE_EXA=1 opencode${RESET}`,
     );
   }
   console.log();
@@ -494,8 +567,8 @@ async function runInstall(config: InstallConfig): Promise<number> {
 
 export async function install(args: InstallArgs): Promise<number> {
   const config: InstallConfig = {
-    hasTmux: false,
-    installCustomSkills: args.skills === 'yes',
+    installCustomSkills: args.skills === 'yes' || args.skills === 'force',
+    forceSkillSync: args.skills === 'force',
     preset: args.preset,
     promptForStar: args.tui,
     dryRun: args.dryRun,

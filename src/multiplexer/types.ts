@@ -5,19 +5,27 @@
  * herdr, etc.) to spawn and manage panes for child agent sessions.
  */
 
-import type { MultiplexerConfig, MultiplexerLayout } from '../config/schema';
+import type { MultiplexerLayout } from '../config/schema';
 
 export interface PaneResult {
   success: boolean;
   paneId?: string;
+  orphanPaneId?: string;
+  error?: 'unavailable' | 'not_found' | 'invalid_state' | 'hard';
+}
+
+export interface PaneSpawnOptions {
+  /** Root/parent OpenCode session that requested this child pane. */
+  parentSessionId?: string;
 }
 
 /**
  * Core multiplexer interface
- * Implementations: TmuxMultiplexer, ZellijMultiplexer, HerdrMultiplexer
+ * Implementations: TmuxMultiplexer, ZellijMultiplexer, HerdrMultiplexer,
+ * CmuxMultiplexer, KittyMultiplexer
  */
 export interface Multiplexer {
-  readonly type: 'tmux' | 'zellij' | 'herdr';
+  readonly type: 'tmux' | 'zellij' | 'herdr' | 'cmux' | 'kitty';
 
   /**
    * Check if the multiplexer binary is available on the system
@@ -41,6 +49,7 @@ export interface Multiplexer {
     description: string,
     serverUrl: string,
     directory: string,
+    options?: PaneSpawnOptions,
   ): Promise<PaneResult>;
 
   /**
@@ -57,11 +66,6 @@ export interface Multiplexer {
    */
   applyLayout(layout: MultiplexerLayout, mainPaneSize: number): Promise<void>;
 }
-
-/**
- * Factory function type for creating multiplexer instances
- */
-export type MultiplexerFactory = (config: MultiplexerConfig) => Multiplexer;
 
 /**
  * Server health check utility (shared across implementations)

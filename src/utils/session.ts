@@ -2,11 +2,12 @@
  * Shared session utilities for council and background managers.
  */
 
-import type { PluginInput } from '@opencode-ai/plugin';
-
-type OpencodeClient = PluginInput['client'];
+import type { OpencodeClient } from '@opencode-ai/sdk';
+import { log } from './logger';
 
 export const SESSION_ABORT_TIMEOUT_MS = 1_000;
+
+export const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 export class OperationTimeoutError extends Error {
   constructor(message: string) {
@@ -50,25 +51,6 @@ export async function abortSessionWithTimeout(
 }
 
 /**
- * Extract the short model label from a "provider/model" string.
- * E.g. "openai/gpt-5.4-mini" → "gpt-5.4-mini"
- */
-export function shortModelLabel(model: string): string {
-  return model.split('/').pop() ?? model;
-}
-
-export type PromptBody = {
-  messageID?: string;
-  model?: { providerID: string; modelID: string };
-  agent?: string;
-  noReply?: boolean;
-  system?: string;
-  tools?: { [key: string]: boolean };
-  parts: Array<{ type: 'text'; text: string }>;
-  variant?: string;
-};
-
-/**
  * Parse a model reference string into provider and model IDs.
  * @param model - Model string in format "provider/model"
  * @returns Object with providerID and modelID, or null if invalid
@@ -109,7 +91,12 @@ export async function promptWithTimeout(
 
   try {
     const promptPromise = client.session.prompt(args);
-    promptPromise.catch(() => {});
+    promptPromise.catch((error) => {
+      log('[session] suppressed prompt rejection (race loser)', {
+        sessionId,
+        error: String(error),
+      });
+    });
 
     const racers: Array<Promise<unknown>> = [promptPromise];
 
@@ -142,11 +129,17 @@ export async function promptWithTimeout(
 
     await Promise.race(racers);
   } catch (error) {
-    if (error instanceof OperationTimeoutError) {
+    // Abort the server-side session on timeout OR signal cancel. Without
+    // the signal branch, a cancelled parent tool leaves the child running
+    // as an orphan ("Task cancelled" to the orchestrator, child still
+    // working). Match by error identity, not `signal.aborted`, so an
+    // unrelated rejection overlapping a signal abort does not fire an
+    // extra abort round-trip.
+    if (isPromptCancellationError(error)) {
       try {
         await abortSessionWithTimeout(client, sessionId);
       } catch {
-        // Best-effort cleanup: preserve the original prompt timeout error.
+        // Best-effort: preserve the original error.
       }
     }
     throw error;
@@ -156,14 +149,65 @@ export async function promptWithTimeout(
   }
 }
 
+/** OperationTimeoutError or our own "Prompt cancelled" Error. */
+function isPromptCancellationError(error: unknown): boolean {
+  if (error instanceof OperationTimeoutError) return true;
+  return error instanceof Error && error.message === 'Prompt cancelled';
+}
+
 /**
  * Result of extracting session content.
- * `empty` is true when the assistant produced zero text content —
+ * `empty` is true when the assistant produced zero text content -
  * the provider returned an empty response (e.g. rate-limited silently).
  */
 export interface SessionExtractionResult {
   text: string;
   empty: boolean;
+  /** True only when the last message is a completed assistant turn with no
+   *  message-level error. This is terminal evidence that the session is not
+   *  idle mid-work; callers must not present partial output as a final result
+   *  without it. */
+  terminal?: boolean;
+}
+
+/** Extract only the final assistant response to keep task retrieval bounded. */
+export async function extractFinalSessionResult(
+  client: OpencodeClient,
+  sessionId: string,
+  options?: { directory?: string; includeReasoning?: boolean },
+): Promise<SessionExtractionResult> {
+  const includeReasoning = options?.includeReasoning ?? true;
+  const messagesResult = await client.session.messages({
+    path: { id: sessionId },
+    ...(options?.directory ? { query: { directory: options.directory } } : {}),
+  });
+  const messages = (messagesResult.data ?? []) as Array<{
+    info?: {
+      role: string;
+      time?: { completed?: number };
+      error?: unknown;
+    };
+    parts?: Array<{ type: string; text?: string }>;
+  }>;
+  const message = messages.findLast((item) => item.info?.role === 'assistant');
+  const text = (message?.parts ?? [])
+    .filter(
+      (part) =>
+        (includeReasoning
+          ? part.type === 'text' || part.type === 'reasoning'
+          : part.type === 'text') && Boolean(part.text),
+    )
+    .flatMap((part) => (typeof part.text === 'string' ? [part.text] : []))
+    .join('\n\n');
+
+  const last = messages[messages.length - 1];
+  const terminal =
+    last !== undefined &&
+    last === message &&
+    typeof last.info?.time?.completed === 'number' &&
+    last.info?.error === undefined;
+
+  return { text, empty: text.length === 0, terminal };
 }
 
 /**

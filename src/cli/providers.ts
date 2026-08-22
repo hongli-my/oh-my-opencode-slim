@@ -10,15 +10,15 @@ export const GENERATED_PRESETS = ['openai', 'opencode-go'] as const;
 // Model mappings by provider/preset.
 export const MODEL_MAPPINGS = {
   openai: {
-    orchestrator: { model: 'openai/gpt-5.5', variant: 'medium' },
-    oracle: { model: 'openai/gpt-5.5', variant: 'high' },
-    librarian: { model: 'openai/gpt-5.4-mini', variant: 'low' },
-    explorer: { model: 'openai/gpt-5.4-mini', variant: 'low' },
-    designer: { model: 'openai/gpt-5.4-mini', variant: 'medium' },
-    fixer: { model: 'openai/gpt-5.5', variant: 'low' },
+    orchestrator: { model: 'openai/gpt-5.6-terra', variant: 'high' },
+    oracle: { model: 'openai/gpt-5.6-sol', variant: 'high' },
+    librarian: { model: 'openai/gpt-5.6-luna', variant: 'low' },
+    explorer: { model: 'openai/gpt-5.6-luna', variant: 'low' },
+    designer: { model: 'openai/gpt-5.6-luna', variant: 'medium' },
+    fixer: { model: 'openai/gpt-5.6-luna', variant: 'high' },
   },
   kimi: {
-    orchestrator: { model: 'kimi-for-coding/k2p5' },
+    orchestrator: { model: 'kimi-for-coding/k2p5', variant: 'max' },
     oracle: { model: 'kimi-for-coding/k2p5', variant: 'high' },
     librarian: { model: 'kimi-for-coding/k2p5', variant: 'low' },
     explorer: { model: 'kimi-for-coding/k2p5', variant: 'low' },
@@ -26,7 +26,7 @@ export const MODEL_MAPPINGS = {
     fixer: { model: 'kimi-for-coding/k2p5', variant: 'low' },
   },
   copilot: {
-    orchestrator: { model: 'github-copilot/claude-opus-4.6' },
+    orchestrator: { model: 'github-copilot/claude-opus-4.6', variant: 'max' },
     oracle: { model: 'github-copilot/claude-opus-4.6', variant: 'high' },
     librarian: { model: 'github-copilot/grok-code-fast-1', variant: 'low' },
     explorer: { model: 'github-copilot/grok-code-fast-1', variant: 'low' },
@@ -37,7 +37,7 @@ export const MODEL_MAPPINGS = {
     fixer: { model: 'github-copilot/claude-sonnet-4.6', variant: 'low' },
   },
   'zai-plan': {
-    orchestrator: { model: 'zai-coding-plan/glm-5' },
+    orchestrator: { model: 'zai-coding-plan/glm-5', variant: 'max' },
     oracle: { model: 'zai-coding-plan/glm-5', variant: 'high' },
     librarian: { model: 'zai-coding-plan/glm-5', variant: 'low' },
     explorer: { model: 'zai-coding-plan/glm-5', variant: 'low' },
@@ -45,27 +45,18 @@ export const MODEL_MAPPINGS = {
     fixer: { model: 'zai-coding-plan/glm-5', variant: 'low' },
   },
   'opencode-go': {
-    orchestrator: { model: 'opencode-go/glm-5.1' },
-    oracle: { model: 'opencode-go/deepseek-v4-pro', variant: 'max' },
-    council: { model: 'opencode-go/deepseek-v4-pro', variant: 'high' },
-    librarian: { model: 'opencode-go/minimax-m2.7' },
-    explorer: { model: 'opencode-go/minimax-m2.7' },
-    designer: { model: 'opencode-go/kimi-k2.6', variant: 'medium' },
+    orchestrator: { model: 'opencode-go/minimax-m3', variant: 'thinking' },
+    oracle: { model: 'opencode-go/qwen3.7-max', variant: 'max' },
+    explorer: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
+    librarian: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
+    designer: { model: 'opencode-go/kimi-k2.7-code' },
     fixer: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
-    observer: { model: 'opencode-go/kimi-k2.6' },
+    observer: { model: 'opencode-go/mimo-v2.5' },
   },
 } as const;
 
 export type PresetName = keyof typeof MODEL_MAPPINGS;
 export type GeneratedPresetName = (typeof GENERATED_PRESETS)[number];
-
-export function isPresetName(value: string): value is PresetName {
-  return Object.hasOwn(MODEL_MAPPINGS, value);
-}
-
-export function getPresetNames(): PresetName[] {
-  return Object.keys(MODEL_MAPPINGS) as PresetName[];
-}
 
 export function isGeneratedPresetName(
   value: string,
@@ -135,14 +126,6 @@ export function generateLiteConfig(
   const presets = config.presets as Record<string, unknown>;
   for (const presetName of GENERATED_PRESETS) {
     presets[presetName] = buildPreset(presetName);
-  }
-
-  if (installConfig.hasTmux) {
-    config.tmux = {
-      enabled: true,
-      layout: 'main-vertical',
-      main_pane_size: 60,
-    };
   }
 
   if (installConfig.companion === 'yes') {

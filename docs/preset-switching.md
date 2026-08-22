@@ -1,21 +1,49 @@
 # Preset Switching
 
-Switch agent model presets at runtime without restarting OpenCode using the `/preset` slash command.
+Switch agent model presets at runtime using the `/preset` TUI slash command.
 
 ## Controls
 
-| Command | Description |
-|---------|-------------|
-| `/preset` | List available presets (highlights the active one) |
-| `/preset <name>` | Switch to the named preset immediately |
+`/preset` opens a **three-level preset manager** in the TUI — pure TUI, like
+the built-in `/models`, so it triggers no LLM turn.
+
+| Level | What you do |
+|-------|-------------|
+| 1. Preset list | Apply / Edit / Delete an existing preset, or create a new one |
+| 2. Agent arrangement | Add / remove / edit the agents in a preset, then Save (or Save & Apply) |
+| 3. Edit agent | Pick model → variant (thinking strength) → temperature → options (JSON) |
+
+> `/preset` is a TUI-only slash command (like `/models`). Invoke it via
+> autocomplete selection or a keybind. Typing `/preset` + Enter does not open
+> the manager (same design as `/models`).
 
 ## How It Works
 
-1. Define named presets in `oh-my-opencode-slim.jsonc` under the `presets` field
-2. Run `/preset <name>` to switch. The plugin calls the OpenCode SDK's `config.update()` method, which triggers a server-side cache invalidation
-3. Agents covered by the new preset get the preset's values
-4. Agents that were in the *previous* preset but are *not* in the new one are reset to their config-file baseline values
-5. The next LLM call uses the new models and settings
+1. Define named presets in `oh-my-opencode-slim.jsonc` under the `presets`
+   field, or create them interactively from the manager
+2. The manager writes preset changes to the user config file
+3. **Apply** persists the preset name to the config file only — the
+   sidebar is NOT refreshed mid-session (the agent registry is unchanged
+   until reload; showing new models against running agents would be
+   misleading)
+4. **Reload OpenCode** (or start a new conversation) for the new preset to
+   take effect on the agent registry
+5. The current session is **not** reloaded — this is deliberate.
+   Hot-swapping the agent tree mid-conversation could truncate context (a
+   new model may have a smaller window), drift prior assistant turns under
+   a changed system prompt, leave running subagents referencing stale agent
+   definitions, or shift tool/skill availability. A future path to true
+   in-session switching without reset requires upgrading
+   `@opencode-ai/plugin` (tracked in #799).
+
+### Level 3 — model and variant selection
+
+The model picker lists every model from all connected providers (fetched from
+the server's provider registry). If the chosen model exposes variants (e.g.
+`thinking`, `high`, `low`), a variant picker follows — this is the "thinking
+strength" selector. Temperature is a numeric prompt (0–2 or blank). Options is
+a raw JSON prompt for provider-specific settings (e.g.
+`{"thinking":{"type":"enabled","budgetTokens":10000}}`).
 
 ## Example Configuration
 
@@ -24,11 +52,11 @@ Switch agent model presets at runtime without restarting OpenCode using the `/pr
   "presets": {
     "cheap": {
       "orchestrator": { "model": "anthropic/claude-3.5-haiku" },
-      "explorer": { "model": "openai/gpt-5.4-mini" },
+      "explorer": { "model": "openai/gpt-5.6-luna" },
       "oracle": { "model": "anthropic/claude-sonnet-4-6" }
     },
     "powerful": {
-      "orchestrator": { "model": "openai/gpt-5.5" },
+      "orchestrator": { "model": "openai/gpt-5.6" },
       "oracle": { "model": "anthropic/claude-opus-4-6" },
       "librarian": { "model": "anthropic/claude-sonnet-4-6" }
     },
@@ -45,7 +73,7 @@ Switch agent model presets at runtime without restarting OpenCode using the `/pr
 
 ## Supported Fields
 
-The following fields are forwarded to the OpenCode SDK at runtime:
+The following fields are applied when the preset is loaded on restart:
 
 | Field | Description |
 |-------|-------------|
@@ -54,7 +82,7 @@ The following fields are forwarded to the OpenCode SDK at runtime:
 | `variant` | Model variant (e.g. `"thinking"`) |
 | `options` | Provider-specific options (e.g. thinking budget) |
 
-Fields not forwarded (require restart): `prompt`, `skills`, `mcps`, `displayName`.
+Fields not applied at runtime (require restart): `prompt`, `skills`, `mcps`, `displayName`.
 
 ## Startup Preset vs Runtime Switching
 
@@ -63,42 +91,11 @@ There are two ways to activate a preset:
 | Method | How | Persists? |
 |--------|-----|-----------|
 | Config file | Set `"preset": "cheap"` in `oh-my-opencode-slim.jsonc` | Yes, across restarts |
-| `/preset` command | Run `/preset cheap` during a session | Across re-inits, not restarts |
+| `/preset` TUI command | Select a preset from the picker during a session | Yes — writes to config file |
 
-Runtime preset switches persist across plugin re-inits (triggered by config changes, etc.) within the same process, but revert on process restart. On restart, the plugin applies the preset from the config file. To make a runtime switch permanent, update the `"preset"` field in your config file.
-
-## Example Output
-
-```
-/preset
-```
-
-```
-Available presets:
-  cheap ← active
-    orchestrator → anthropic/claude-3.5-haiku
-    explorer → openai/gpt-5.4-mini
-    oracle → anthropic/claude-sonnet-4-6
-  powerful
-    orchestrator → openai/gpt-5.5
-    oracle → anthropic/claude-opus-4-6
-
-Usage: /preset <name> to switch.
-```
-
-```
-/preset powerful
-```
-
-```
-Switched to preset "powerful":
-orchestrator → model: openai/gpt-5.5
-oracle → model: anthropic/claude-opus-4-6
-Reset to baseline: explorer
-```
-
-The "Reset to baseline" line appears when agents from the previous preset
-are not present in the new one. Those agents are reverted to their
-config-file defaults.
+The `/preset` TUI command writes the selected preset name to the config file,
+so the switch persists across restarts. **Reload OpenCode** for the new preset
+to take effect on the agent registry. The current session continues
+uninterrupted with its existing models.
 
 > See [Configuration](configuration.md) for the full preset option reference.

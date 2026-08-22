@@ -1,16 +1,52 @@
 import { Readability } from '@mozilla/readability';
+import { JSDOM, VirtualConsole } from 'jsdom';
 import TurndownService from 'turndown';
+import { escapeHtml } from '../../utils/escape-html';
+import { parseFrontmatter } from '../../utils/frontmatter';
 import type { CachedFetch, ExtractedContent } from './types';
 
-let jsdomPromise: Promise<typeof import('jsdom')> | undefined;
+export { escapeHtml, parseFrontmatter };
 
-async function getJSDOM() {
-  jsdomPromise ??= import('jsdom');
-  const { JSDOM } = await jsdomPromise;
-  return JSDOM;
+const CSS_TREE_WARN_PREFIX = '[csstree-match]';
+
+/**
+ * Suppresses css-tree lexer warnings ([csstree-match] prefix) emitted
+ * synchronously during JSDOM construction (jsdom uses css-tree to parse
+ * stylesheets; css-tree calls the global console.warn directly, bypassing
+ * jsdom's virtualConsole). Other warnings pass through untouched.
+ */
+export function withCssTreeWarningsSuppressed<T>(fn: () => T): T {
+  const originalWarn = console.warn;
+  console.warn = ((...args: unknown[]) => {
+    const first = typeof args[0] === 'string' ? args[0] : '';
+    if (!first.startsWith(CSS_TREE_WARN_PREFIX)) originalWarn(...args);
+  }) as typeof console.warn;
+  try {
+    return fn();
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
-export function wordCount(text: string) {
+/**
+ * Suppresses jsdom "css-parsing" errors ("Could not parse CSS stylesheet")
+ * that jsdom would otherwise forward to console.error when no custom
+ * virtualConsole is supplied, leaking parser noise into the TUI. Other
+ * jsdomErrors pass through to console.error as full error objects,
+ * preserving stack, cause, and URL metadata.
+ */
+export function withJsdomCssParsingErrorsSuppressed<T>(
+  fn: (vc: VirtualConsole) => T,
+): T {
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', (error) => {
+    const type = (error as Error & { type?: string }).type;
+    if (type !== 'css-parsing') console.error(error);
+  });
+  return fn(vc);
+}
+
+export function wordCount(text: string): number {
   const trimmed = text.trim();
   if (!trimmed) return 0;
   return trimmed.split(/\s+/).length;
@@ -24,7 +60,7 @@ function quote(value: unknown) {
   return JSON.stringify(value ?? '');
 }
 
-export function frontmatter(metadata: Record<string, unknown>) {
+export function frontmatter(metadata: Record<string, unknown>): string {
   const lines = ['---'];
   for (const [key, value] of Object.entries(metadata)) {
     if (value === undefined) continue;
@@ -43,7 +79,7 @@ export function frontmatter(metadata: Record<string, unknown>) {
   return lines.join('\n');
 }
 
-export function trimBlankRuns(input: string) {
+export function trimBlankRuns(input: string): string {
   return input.replace(/\n{3,}/g, '\n\n').trim();
 }
 
@@ -154,7 +190,7 @@ function extractStructuredText(root: Element | null) {
   return cleanExtractedText(chunks.join(''));
 }
 
-export function cleanHeadingText(input: string) {
+export function cleanHeadingText(input: string): string {
   const normalized = trimBlankRuns(input).replace(/¶+$/g, '').trim();
   if (/^(?:C|F)#$/.test(normalized)) return normalized;
   if (/\s#+$/.test(normalized)) {
@@ -163,7 +199,7 @@ export function cleanHeadingText(input: string) {
   return normalized;
 }
 
-export function cleanFetchedMarkdown(input: string) {
+export function cleanFetchedMarkdown(input: string): string {
   const output = mapOutsideCodeBlocks(input, (value) =>
     value
       .replace(/^\s*!\[[^\]]*\]\([^)]+\)\s*$/gm, 'Image omitted')
@@ -178,24 +214,15 @@ export function cleanFetchedMarkdown(input: string) {
   return trimBlankRuns(output);
 }
 
-export function cleanFetchedText(input: string) {
+export function cleanFetchedText(input: string): string {
   return trimBlankRuns(input);
-}
-
-export function escapeHtml(input: string) {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 export function withTruncationMarker(
   content: string,
   format: 'text' | 'markdown' | 'html',
   truncated: boolean,
-) {
+): string {
   if (!truncated) return content;
   if (format === 'html') return `${content}\n<!-- [..content truncated..] -->`;
   return `${content}\n\n[..content truncated..]`;
@@ -205,7 +232,7 @@ export function joinRenderedContent(
   metadata: string,
   content: string,
   format: 'text' | 'markdown' | 'html',
-) {
+): string {
   if (!metadata) return content;
   if (!content) {
     return format === 'html' ? `<!--\n${metadata.trim()}\n-->` : metadata;
@@ -226,7 +253,7 @@ export function joinRenderedContent(
 export function renderMessageForFormat(
   content: string,
   format: 'text' | 'markdown' | 'html',
-) {
+): string {
   if (format === 'html') return `<pre>${escapeHtml(content)}</pre>`;
   return content;
 }
@@ -288,8 +315,11 @@ export async function extractFromHtml(
   finalUrl: string,
   extractMain: boolean,
 ): Promise<ExtractedContent> {
-  const JSDOM = await getJSDOM();
-  const dom = new JSDOM(html, { url: finalUrl });
+  const dom = withCssTreeWarningsSuppressed(() =>
+    withJsdomCssParsingErrorsSuppressed(
+      (vc) => new JSDOM(html, { url: finalUrl, virtualConsole: vc }),
+    ),
+  );
   const document = dom.window.document;
   const title = document.title || undefined;
   const canonical =
@@ -311,7 +341,11 @@ export async function extractFromHtml(
     .slice(0, 12);
 
   if (extractMain) {
-    const readerDom = new JSDOM(html, { url: finalUrl });
+    const readerDom = withCssTreeWarningsSuppressed(() =>
+      withJsdomCssParsingErrorsSuppressed(
+        (vc) => new JSDOM(html, { url: finalUrl, virtualConsole: vc }),
+      ),
+    );
     const article = new Readability(readerDom.window.document).parse();
     if (article?.content?.trim()) {
       const articleContainer = readerDom.window.document.createElement('div');
@@ -346,21 +380,9 @@ export async function extractFromHtml(
   };
 }
 
-function parseFrontmatterBlock(content: string) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
-  if (!match) return undefined;
-  const result: Record<string, string> = {};
-  for (const line of match[1].split(/\r?\n/)) {
-    const kv = line.match(/^([A-Za-z0-9_-]+):\s*(.+?)\s*$/);
-    if (!kv) continue;
-    result[kv[1]] = kv[2].replace(/^(['"])(.*)\1$/, '$2');
-  }
-  return result;
-}
-
 export function inferCanonicalUrlFromText(content: string, finalUrl: string) {
-  const frontmatter = parseFrontmatterBlock(content);
-  const raw = frontmatter?.url;
+  const frontmatterData = parseFrontmatter(content);
+  const raw = frontmatterData?.url;
   if (!raw) return undefined;
   try {
     return new URL(raw, finalUrl).toString();

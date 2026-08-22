@@ -1,8 +1,18 @@
-import type { TuiPluginModule } from '@opencode-ai/plugin/tui';
+import type {
+  TuiCommand,
+  TuiPluginApi,
+  TuiPluginModule,
+} from '@opencode-ai/plugin/tui';
+import { type ColorInput, parseColor, RGBA } from '@opentui/core';
 import type { JSX } from '@opentui/solid';
 import { createElement, insert, setProp } from '@opentui/solid';
 import { DEFAULT_DISABLED_AGENTS, SUBAGENT_NAMES } from './config/constants';
 import { loadPluginConfig } from './config/loader';
+import {
+  recordTmuxPane,
+  removeTmuxPane,
+} from './multiplexer/tmux-pane-registry';
+import { openPresetManager } from './tui-preset';
 import {
   readTuiSnapshot,
   readTuiSnapshotAsync,
@@ -19,6 +29,7 @@ const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
     !DEFAULT_DISABLED_AGENTS.includes(agent),
 );
 const BORDER = { type: 'single' };
+const TMUX_PANE_HEARTBEAT_MS = 10_000;
 
 type Child = JSX.Element | string | number | null | undefined | false;
 
@@ -52,7 +63,7 @@ function element(
     insert(node, child);
   }
 
-  return node as JSX.Element;
+  return node as unknown as JSX.Element;
 }
 
 function text(props: Record<string, unknown>, children: Child[]) {
@@ -67,6 +78,61 @@ function getTuiDirectory(api: {
   state?: { path?: { directory?: string } };
 }): string {
   return api.state?.path?.directory ?? process.cwd();
+}
+
+export interface ActiveTmuxPaneRegistration {
+  sessionId?: string;
+  paneId?: string;
+  ownerPid: number;
+  lastRecordedAt: number;
+}
+
+function clearTmuxPaneRegistration(
+  registration: ActiveTmuxPaneRegistration,
+): void {
+  if (registration.sessionId && registration.paneId) {
+    removeTmuxPane(
+      registration.sessionId,
+      registration.paneId,
+      registration.ownerPid,
+    );
+  }
+  registration.sessionId = undefined;
+  registration.paneId = undefined;
+  registration.lastRecordedAt = 0;
+}
+
+export function syncTmuxPaneRegistration(
+  api: Pick<TuiPluginApi, 'route'>,
+  registration: ActiveTmuxPaneRegistration,
+  now = Date.now(),
+): void {
+  const paneId = process.env.TMUX_PANE;
+  const route = api.route.current;
+  const routeParams = 'params' in route ? route.params : undefined;
+  const sessionId =
+    route.name === 'session' &&
+    routeParams &&
+    typeof routeParams.sessionID === 'string'
+      ? routeParams.sessionID
+      : undefined;
+  const unchanged =
+    registration.sessionId === sessionId && registration.paneId === paneId;
+
+  if (!paneId || !sessionId) {
+    clearTmuxPaneRegistration(registration);
+    return;
+  }
+  if (unchanged && now - registration.lastRecordedAt < TMUX_PANE_HEARTBEAT_MS) {
+    return;
+  }
+  if (!unchanged) clearTmuxPaneRegistration(registration);
+
+  if (recordTmuxPane(sessionId, paneId, registration.ownerPid)) {
+    registration.sessionId = sessionId;
+    registration.paneId = paneId;
+    registration.lastRecordedAt = now;
+  }
 }
 
 export function splitSidebarModelId(model: string): {
@@ -124,10 +190,10 @@ function agentRow(
 function compactAgentRow(
   label: string,
   model: string,
-  variant: string | undefined,
+  _variant: string | undefined,
   theme: { textMuted: unknown },
 ): JSX.Element {
-  const value = variant ? `${model} (${variant})` : model;
+  const modelName = splitSidebarModelId(model).model;
   return box(
     {
       width: '100%',
@@ -136,9 +202,64 @@ function compactAgentRow(
     },
     [
       text({ fg: theme.textMuted, width: 14 }, [label]),
-      text({ fg: theme.textMuted }, [value]),
+      text({ fg: theme.textMuted }, [modelName]),
     ],
   );
+}
+
+export function getContrastForeground(
+  accent: unknown,
+  themeText: unknown,
+  themeBackground: unknown,
+): unknown {
+  if (!accent) return themeText;
+
+  let accentRgba: RGBA;
+  try {
+    accentRgba = parseColor(accent as ColorInput);
+  } catch {
+    return themeText;
+  }
+
+  // Calculate relative luminance: R, G, B are in range 0..1
+  const luminance =
+    0.299 * accentRgba.r + 0.587 * accentRgba.g + 0.114 * accentRgba.b;
+
+  if (luminance > 0.5) {
+    // Light accent bg -> we need a dark fg.
+    // Let's use themeBackground if it exists, is resolved, and not transparent.
+    if (themeBackground) {
+      try {
+        const bgRgba = parseColor(themeBackground as ColorInput);
+        if (bgRgba.a !== 0) {
+          const bgLum = 0.299 * bgRgba.r + 0.587 * bgRgba.g + 0.114 * bgRgba.b;
+          if (bgLum < 0.5) {
+            return themeBackground;
+          }
+        }
+      } catch {
+        // ignore and fallback
+      }
+    }
+    return RGBA.fromInts(0, 0, 0);
+  }
+
+  // Dark accent bg -> we need a light fg.
+  // Let's use themeText if it exists and is light.
+  if (themeText) {
+    try {
+      const textRgba = parseColor(themeText as ColorInput);
+      const textLum =
+        0.299 * textRgba.r + 0.587 * textRgba.g + 0.114 * textRgba.b;
+      if (textLum > 0.5) {
+        return themeText;
+      }
+    } catch {
+      // ignore and fallback
+    }
+  }
+
+  return RGBA.fromInts(255, 255, 255);
 }
 
 function renderSidebar(
@@ -177,7 +298,18 @@ function renderSidebar(
         [
           box(
             { paddingLeft: 1, paddingRight: 1, backgroundColor: theme.accent },
-            [text({ fg: theme.background }, ['OMO-Slim'])],
+            [
+              text(
+                {
+                  fg: getContrastForeground(
+                    theme.accent,
+                    theme.text,
+                    theme.background,
+                  ),
+                },
+                ['OMO-Slim'],
+              ),
+            ],
           ),
           text({ fg: theme.textMuted }, [`v${version}`]),
         ],
@@ -225,16 +357,56 @@ function readConfigState(directory: string): {
   let configInvalid = false;
   const config = loadPluginConfig(directory, {
     silent: true,
-    onWarning: () => {
-      configInvalid = true;
+    onWarning: (warning) => {
+      // Only genuinely broken configs (parse/load/schema failures) mark the
+      // sidebar invalid. Benign deprecation notices (deprecated-key) and
+      // missing-preset do not, otherwise a config that loads fine would be
+      // shown as "Config invalid".
+      if (
+        warning.kind === 'invalid-json' ||
+        warning.kind === 'invalid-schema' ||
+        warning.kind === 'read-error'
+      ) {
+        configInvalid = true;
+      }
     },
   });
-  const compactSidebar = config.compactSidebar ?? false;
+  const compactSidebar = config.compactSidebar ?? true;
   return { configInvalid, compactSidebar };
 }
 
 export function readConfigInvalid(directory: string): boolean {
   return readConfigState(directory).configInvalid;
+}
+
+export function readCompactSidebar(directory: string): boolean {
+  return readConfigState(directory).compactSidebar;
+}
+
+/**
+ * Build the TUI slash command for `/preset`. Registered via the legacy
+ * `api.command` API (still populated in OpenCode 1.18 for v1 plugins). If the
+ * API is unavailable the command is simply not registered and `/preset` is a
+ * no-op.
+ *
+ * The command opens a three-level preset manager (list → edit → agent model)
+ * implemented in `src/tui-preset.ts`. Like the built-in `/models`, it is pure
+ * TUI and triggers no LLM turn.
+ */
+function buildPresetCommand(
+  api: TuiPluginApi,
+  directoryGetter: () => string,
+  snapshotRef: { snapshot: TuiSnapshot },
+): TuiCommand {
+  return {
+    title: 'Switch preset',
+    value: 'preset',
+    description: 'Switch agent presets at runtime (e.g. /preset cheap)',
+    slash: { name: 'preset' },
+    onSelect: () => {
+      openPresetManager(api, directoryGetter(), snapshotRef);
+    },
+  };
 }
 
 const plugin: TuiPluginModule & { id: string } = {
@@ -245,11 +417,17 @@ const plugin: TuiPluginModule & { id: string } = {
     const version = meta.version ?? (await readPackageVersion()) ?? 'dev';
     let configDirectory = getTuiDirectory(api);
     let { configInvalid, compactSidebar } = readConfigState(configDirectory);
-    let snapshot = readTuiSnapshot();
+    let snapshot = readTuiSnapshot(configDirectory);
+    const tmuxRegistration: ActiveTmuxPaneRegistration = {
+      ownerPid: process.pid,
+      lastRecordedAt: 0,
+    };
+    syncTmuxPaneRegistration(api, tmuxRegistration);
     const renderTimer = setInterval(async () => {
       try {
-        snapshot = await readTuiSnapshotAsync();
         const currentDirectory = getTuiDirectory(api);
+        syncTmuxPaneRegistration(api, tmuxRegistration);
+        snapshot = await readTuiSnapshotAsync(currentDirectory);
         if (currentDirectory !== configDirectory) {
           configDirectory = currentDirectory;
           ({ configInvalid, compactSidebar } =
@@ -263,6 +441,7 @@ const plugin: TuiPluginModule & { id: string } = {
 
     api.lifecycle.onDispose(() => {
       clearInterval(renderTimer);
+      clearTmuxPaneRegistration(tmuxRegistration);
     });
 
     api.slots.register({
@@ -279,6 +458,26 @@ const plugin: TuiPluginModule & { id: string } = {
         },
       },
     });
+
+    // `/preset` is a pure TUI slash command (like the built-in `/models`):
+    // it opens a picker, switches the preset via on-disk state, and never
+    // sends a message to the server or triggers an LLM turn. The legacy
+    // `api.command` API is still populated in OpenCode 1.18; if it is absent
+    // (e.g. a future v2-only build), registration is skipped gracefully.
+    if (api.command) {
+      const snapshotRef: { snapshot: TuiSnapshot } = {
+        get snapshot() {
+          return snapshot;
+        },
+        set snapshot(value: TuiSnapshot) {
+          snapshot = value;
+        },
+      };
+      const disposeCommands = api.command.register(() => [
+        buildPresetCommand(api, () => configDirectory, snapshotRef),
+      ]);
+      api.lifecycle.onDispose(disposeCommands);
+    }
   },
 };
 

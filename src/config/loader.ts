@@ -2,7 +2,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripJsonComments } from '../cli/config-io';
 import { getConfigSearchDirs } from '../cli/paths';
-import { type PluginConfig, PluginConfigSchema } from './schema';
+import { DEFAULT_DISABLED_AGENTS } from './constants';
+import {
+  InterviewConfigSchema,
+  LEGACY_FALLBACK_KEYS,
+  type PluginConfig,
+  PluginConfigSchema,
+  WebfetchConfigSchema,
+} from './schema';
 
 /**
  * Warning kinds produced during config loading.
@@ -11,7 +18,9 @@ export type ConfigLoadWarningKind =
   | 'invalid-json'
   | 'invalid-schema'
   | 'read-error'
-  | 'missing-preset';
+  | 'missing-preset'
+  | 'deprecated-key'
+  | 'normalized';
 
 /**
  * A warning emitted while loading plugin configuration.
@@ -40,6 +49,106 @@ export interface LoadPluginConfigOptions {
 }
 
 const PROMPTS_DIR_NAME = 'oh-my-opencode-slim';
+const INTERVIEW_CONFIG_KEYS = [
+  'maxQuestions',
+  'outputFolder',
+  'autoOpenBrowser',
+  'port',
+  'dashboard',
+] as const;
+
+// Config keys that must be arrays. A string value (e.g. "explorer") is
+// normalized to a single-element array; any other non-array value is
+// dropped. Normalization happens before schema validation so a typo in one
+// key does not silently discard the user's entire config (issue #1027).
+const DISABLED_CONFIG_KEYS = [
+  'disabled_agents',
+  'disabled_tools',
+  'disabled_mcps',
+  'disabled_skills',
+] as const;
+
+/**
+ * Normalize disabled_* config keys in place so a non-array value does not
+ * reject the whole config object during schema validation. A string value
+ * (e.g. "explorer") becomes a single-element array so the user's disable
+ * intent survives; any other non-array value (number, boolean, object, ...)
+ * is dropped. Array and undefined values are left untouched. Each
+ * normalization is reported through `warn` (if provided) with a plain
+ * message; callers wrap it in their own warning channel (loader uses
+ * onWarning + console.warn, doctor just reports the message).
+ *
+ * @param rawConfig - Parsed config to normalize (mutated in place)
+ * @param warn - Optional callback invoked with each warning message
+ */
+export function normalizeDisabledArrayKeys(
+  rawConfig: unknown,
+  warn?: (message: string) => void,
+): void {
+  if (
+    typeof rawConfig !== 'object' ||
+    rawConfig === null ||
+    Array.isArray(rawConfig)
+  ) {
+    return;
+  }
+
+  const configRecord = rawConfig as Record<string, unknown>;
+  for (const key of DISABLED_CONFIG_KEYS) {
+    const value = configRecord[key];
+    if (value === undefined || Array.isArray(value)) {
+      continue;
+    }
+    if (typeof value === 'string') {
+      configRecord[key] = [value];
+      warn?.(
+        `Config key "${key}" should be an array; ` +
+          `normalized to ["${value}"].`,
+      );
+    } else {
+      delete configRecord[key];
+      warn?.(`Config key "${key}" must be an array; ignoring invalid value.`);
+    }
+  }
+}
+
+function retainExplicitInterviewFields(
+  parsedConfig: PluginConfig,
+  rawConfig: unknown,
+): PluginConfig {
+  if (!parsedConfig.interview) {
+    return parsedConfig;
+  }
+
+  const rawInterview =
+    typeof rawConfig === 'object' &&
+    rawConfig !== null &&
+    !Array.isArray(rawConfig) &&
+    typeof (rawConfig as Record<string, unknown>).interview === 'object' &&
+    (rawConfig as Record<string, unknown>).interview !== null &&
+    !Array.isArray((rawConfig as Record<string, unknown>).interview)
+      ? ((rawConfig as Record<string, unknown>).interview as Record<
+          string,
+          unknown
+        >)
+      : undefined;
+
+  if (!rawInterview) {
+    return { ...parsedConfig, interview: undefined };
+  }
+
+  const interview: Record<string, unknown> = {};
+  for (const key of INTERVIEW_CONFIG_KEYS) {
+    if (Object.hasOwn(rawInterview, key)) {
+      interview[key] = parsedConfig.interview[key];
+    }
+  }
+
+  return {
+    ...parsedConfig,
+    interview: interview as PluginConfig['interview'],
+  };
+}
 
 /**
  * Load and validate plugin configuration from a specific file path.
@@ -56,7 +165,9 @@ function loadConfigFromPath(
   options?: LoadPluginConfigOptions,
 ): PluginConfig | null {
   try {
-    const content = fs.readFileSync(configPath, 'utf-8');
+    // Strip a UTF-8 BOM (RFC 8259 permits one); JSON.parse would otherwise
+    // fail with "Unrecognized token" and silently drop the whole config.
+    const content = fs.readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, '');
     // Use stripJsonComments to support JSONC format (comments and trailing commas)
     let rawConfig: unknown;
     try {
@@ -82,6 +193,88 @@ function loadConfigFromPath(
       }
       return null;
     }
+    // Warn about deprecated tmux key
+    if (
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      'tmux' in (rawConfig as Record<string, unknown>)
+    ) {
+      const tmuxMsg =
+        'Deprecated tmux config key found and ignored. Use multiplexer config instead.';
+      options?.onWarning?.({
+        path: configPath,
+        kind: 'deprecated-key',
+        message: tmuxMsg,
+      });
+      if (!options?.silent) {
+        console.warn(`[oh-my-opencode-slim] ${tmuxMsg}`);
+      }
+    }
+
+    // Warn about deprecated council.master key
+    if (
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      typeof (rawConfig as Record<string, unknown>).council === 'object' &&
+      (rawConfig as Record<string, unknown>).council !== null &&
+      'master' in
+        ((rawConfig as Record<string, unknown>).council as Record<
+          string,
+          unknown
+        >)
+    ) {
+      const masterMsg =
+        'Deprecated council.master config key found and ignored. Configure council agents via presets instead.';
+      options?.onWarning?.({
+        path: configPath,
+        kind: 'deprecated-key',
+        message: masterMsg,
+      });
+      if (!options?.silent) {
+        console.warn(`[oh-my-opencode-slim] ${masterMsg}`);
+      }
+    }
+
+    // Warn about deprecated fallback.* keys. The schema strips these before
+    // validation so the rest of the config still loads; without this warning
+    // users would not know their stale keys are ignored.
+    if (
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      typeof (rawConfig as Record<string, unknown>).fallback === 'object' &&
+      (rawConfig as Record<string, unknown>).fallback !== null
+    ) {
+      const fallback = (rawConfig as Record<string, unknown>)
+        .fallback as Record<string, unknown>;
+      const present = LEGACY_FALLBACK_KEYS.filter((key) => key in fallback);
+      if (present.length > 0) {
+        const fallbackMsg = `Deprecated fallback config key${present.length === 1 ? '' : 's'} ${present.join(', ')} found and ignored. These fields were removed in 2.3.x; fallback behavior is controlled by fallback.enabled and fallback.maxRetries.`;
+        options?.onWarning?.({
+          path: configPath,
+          kind: 'deprecated-key',
+          message: fallbackMsg,
+        });
+        if (!options?.silent) {
+          console.warn(`[oh-my-opencode-slim] ${fallbackMsg}`);
+        }
+      }
+    }
+
+    // Normalize disabled_* config keys before schema validation so a
+    // non-array value does not reject the whole config object (which would
+    // silently discard every other user setting). Reported with the
+    // 'normalized' kind so TUI/doctor do not treat a fixed config as invalid.
+    normalizeDisabledArrayKeys(rawConfig, (message) => {
+      options?.onWarning?.({
+        path: configPath,
+        kind: 'normalized',
+        message,
+      });
+      if (!options?.silent) {
+        console.warn(`[oh-my-opencode-slim] ${message}`);
+      }
+    });
+
     const result = PluginConfigSchema.safeParse(rawConfig);
 
     if (!result.success) {
@@ -98,7 +291,32 @@ function loadConfigFromPath(
       return null;
     }
 
-    return result.data;
+    // Zod applies nested defaults while parsing each layer. Keep interview
+    // defaults from masquerading as explicitly configured overrides; the
+    // merged interview config is normalized after all layers are merged.
+    const layerConfig = retainExplicitInterviewFields(result.data, rawConfig);
+
+    // Zod applies webfetch.enabled's default while parsing each layer. Keep
+    // that default from masquerading as an explicitly configured override;
+    // the merged webfetch config is normalized after all layers are merged.
+    if (
+      layerConfig.webfetch &&
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      'webfetch' in rawConfig &&
+      typeof rawConfig.webfetch === 'object' &&
+      rawConfig.webfetch !== null &&
+      !Array.isArray(rawConfig.webfetch) &&
+      !Object.hasOwn(rawConfig.webfetch, 'enabled')
+    ) {
+      const { enabled: _enabled, ...webfetch } = layerConfig.webfetch;
+      return {
+        ...layerConfig,
+        webfetch: webfetch as PluginConfig['webfetch'],
+      };
+    }
+
+    return layerConfig;
   } catch (error) {
     // File doesn't exist or isn't readable - this is expected and fine
     if (
@@ -158,6 +376,43 @@ function findConfigPathInDirs(
 }
 
 /**
+ * Validate that `image_routing: "auto"` has a live observer agent to route
+ * images to. Emits a warning (via `onWarning`/`console.warn`) and returns
+ * `false` if "auto" routing is configured but the observer agent is
+ * disabled, since images would then have nowhere to go.
+ *
+ * @param config - Plugin configuration to validate
+ * @param configPath - Path of the config file, used in the warning payload
+ * @param options - Optional load options including the onWarning callback
+ * @returns `true` if the routing configuration is valid, `false` otherwise
+ */
+function validateFinalImageRouting(
+  config: PluginConfig,
+  configPath: string,
+  options?: LoadPluginConfigOptions,
+): boolean {
+  if (config.image_routing !== 'auto') return true;
+
+  const disabledAgents = Array.isArray(config.disabled_agents)
+    ? config.disabled_agents
+    : DEFAULT_DISABLED_AGENTS;
+  if (!disabledAgents.includes('observer')) return true;
+
+  const message =
+    'image_routing "auto" requires observer to be enabled. ' +
+    'Remove "observer" from disabled_agents.';
+  options?.onWarning?.({
+    path: configPath,
+    kind: 'invalid-schema',
+    message,
+  });
+  if (!options?.silent) {
+    console.warn(`[oh-my-opencode-slim] Invalid config: ${message}`);
+  }
+  return false;
+}
+
+/**
  * Find plugin config paths (user and project) for a given directory.
  * User config uses getConfigSearchDirs() for lookup.
  * Project config uses <directory>/.opencode/oh-my-opencode-slim.
@@ -198,12 +453,15 @@ export function mergePluginConfigs(
     ...override,
     agents: deepMerge(base.agents, override.agents),
     presets: deepMerge(base.presets, override.presets),
-    tmux: deepMerge(base.tmux, override.tmux),
     multiplexer: deepMerge(base.multiplexer, override.multiplexer),
     interview: deepMerge(base.interview, override.interview),
     backgroundJobs: deepMerge(base.backgroundJobs, override.backgroundJobs),
     fallback: deepMerge(base.fallback, override.fallback),
     council: deepMerge(base.council, override.council),
+    webfetch: deepMerge(
+      base.webfetch as Record<string, unknown> | undefined,
+      override.webfetch as Record<string, unknown> | undefined,
+    ) as PluginConfig['webfetch'],
     acpAgents: deepMerge(base.acpAgents, override.acpAgents),
     companion: deepMerge(
       base.companion as Record<string, unknown> | undefined,
@@ -260,7 +518,7 @@ export function deepMerge<T extends Record<string, unknown>>(
  * 2. Project config: <directory>/.opencode/oh-my-opencode-slim.jsonc or .json
  *
  * JSONC format is preferred over JSON (allows comments and trailing commas).
- * Project config takes precedence over user config. Nested objects (agents, tmux) are
+ * Project config takes precedence over user config. Nested objects (agents, multiplexer) are
  * deep-merged, while top-level arrays are replaced entirely by project config.
  *
  * @param directory - Project directory to search for .opencode config
@@ -285,8 +543,12 @@ export function loadPluginConfig(
     config = mergePluginConfigs(config, projectConfig);
   }
 
-  // Migrate legacy tmux config to multiplexer config for backward compatibility
-  config = migrateTmuxToMultiplexer(config);
+  if (config.webfetch) {
+    config.webfetch = WebfetchConfigSchema.parse(config.webfetch);
+  }
+  if (config.interview) {
+    config.interview = InterviewConfigSchema.parse(config.interview);
+  }
 
   // Override preset from environment variable if set
   const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
@@ -332,6 +594,17 @@ export function loadPluginConfig(
       debug: config.companion.debug ?? false,
     };
   }
+
+  validateFinalImageRouting(
+    config,
+    projectConfigPath ?? userConfigPath ?? '',
+    options,
+  );
+  // Note: we intentionally do NOT override image_routing to 'direct' here.
+  // The observer-disabled guard in processImageAttachments handles the
+  // auto+observer-disabled case by returning true, which triggers the
+  // debounced toast in index.ts. Overriding to 'direct' here would prevent
+  // processImageAttachments from returning true and suppress the toast.
 
   return config;
 }
@@ -428,34 +701,4 @@ export function loadAgentPrompt(
   );
 
   return result;
-}
-
-/**
- * Migrate legacy tmux config to multiplexer config for backward compatibility.
- * If tmux.enabled is true and no multiplexer config is set, creates a multiplexer
- * config from the tmux settings.
- *
- * @param config - Plugin config to migrate
- * @returns Config with multiplexer settings applied
- */
-function migrateTmuxToMultiplexer(config: PluginConfig): PluginConfig {
-  // If multiplexer is already configured, use it as-is
-  if (config.multiplexer?.type && config.multiplexer.type !== 'none') {
-    return config;
-  }
-
-  // If tmux is enabled, migrate to multiplexer
-  if (config.tmux?.enabled) {
-    return {
-      ...config,
-      multiplexer: {
-        type: 'tmux',
-        layout: config.tmux.layout ?? 'main-vertical',
-        main_pane_size: config.tmux.main_pane_size ?? 60,
-        zellij_pane_mode: 'agent-tab',
-      },
-    };
-  }
-
-  return config;
 }

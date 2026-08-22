@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { recordTmuxPane } from '../tmux-pane-registry';
 
 type SpawnResult = {
   exited: Promise<number>;
@@ -52,8 +56,12 @@ function commands(): string[][] {
 describe('TmuxMultiplexer', () => {
   const originalTmux = process.env.TMUX;
   const originalTmuxPane = process.env.TMUX_PANE;
+  const originalXdgDataHome = process.env.XDG_DATA_HOME;
+  let stateDirectory: string;
 
   beforeEach(() => {
+    stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tmux-'));
+    process.env.XDG_DATA_HOME = stateDirectory;
     process.env.TMUX = '/tmp/tmux-test/default,1,0';
     process.env.TMUX_PANE = '%1';
 
@@ -71,8 +79,79 @@ describe('TmuxMultiplexer', () => {
   });
 
   afterEach(() => {
+    fs.rmSync(stateDirectory, { recursive: true, force: true });
+    if (originalXdgDataHome === undefined) {
+      delete process.env.XDG_DATA_HOME;
+    } else {
+      process.env.XDG_DATA_HOME = originalXdgDataHome;
+    }
     process.env.TMUX = originalTmux;
     process.env.TMUX_PANE = originalTmuxPane;
+  });
+
+  test('targets the pane registered by the attached parent session', async () => {
+    recordTmuxPane('root-session-b', '%42');
+    const { TmuxMultiplexer } = await importFreshTmux();
+    const tmux = new TmuxMultiplexer('main-vertical', 60);
+
+    await tmux.spawnPane(
+      'child-session',
+      'Attached worker',
+      'http://localhost:4096',
+      '/repo',
+      { parentSessionId: 'root-session-b' },
+    );
+
+    const splitCommand = commands().find((command) =>
+      command.includes('split-window'),
+    );
+    expect(splitCommand).toContain('%42');
+    expect(splitCommand).not.toContain('%1');
+
+    await wait(300);
+    const layoutCommands = commands().filter((command) =>
+      command.includes('select-layout'),
+    );
+    expect(layoutCommands).toHaveLength(2);
+    expect(layoutCommands.every((command) => command.includes('%42'))).toBe(
+      true,
+    );
+  });
+
+  test('falls back to the server pane when a registered target rejects the split', async () => {
+    recordTmuxPane('root-session-b', '%42');
+    crossSpawnMock.mockImplementation((command: string[]) => {
+      if (command[0] === 'which')
+        return createSpawnResult(0, '/usr/bin/tmux\n');
+      if (command[1] === '-V') return createSpawnResult(0, 'tmux 3.6a');
+      if (command[1] === 'split-window' && command.includes('%42')) {
+        return createSpawnResult(1, '', 'target pane not found');
+      }
+      if (command[1] === 'split-window') {
+        return createSpawnResult(0, '%2\n');
+      }
+      return createSpawnResult();
+    });
+    const { TmuxMultiplexer } = await importFreshTmux();
+    const tmux = new TmuxMultiplexer('main-vertical', 60);
+
+    const result = await tmux.spawnPane(
+      'child-session',
+      'Attached worker',
+      'http://localhost:4096',
+      '/repo',
+      { parentSessionId: 'root-session-b' },
+    );
+
+    const splitCommands = commands().filter((command) =>
+      command.includes('split-window'),
+    );
+    expect(result).toEqual({ success: true, paneId: '%2' });
+    expect(splitCommands).toHaveLength(2);
+    expect(splitCommands[0]).toContain('%42');
+    expect(splitCommands[1]).toContain('%1');
+
+    await tmux.applyLayout('tiled', 60);
   });
 
   test('coalesces layout application after bursty pane spawns', async () => {

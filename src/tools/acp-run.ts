@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { type ToolDefinition, tool } from '@opencode-ai/plugin';
+import packageJson from '../../package.json' with { type: 'json' };
 import {
   type AcpAgentConfig,
   type AcpAgentsConfig,
@@ -32,6 +33,17 @@ type Pending = {
   resolve: (value: Json | undefined) => void;
   reject: (error: Error) => void;
 };
+
+export function createAcpInitializeParams() {
+  return {
+    protocolVersion: 1,
+    clientCapabilities: {},
+    clientInfo: {
+      name: 'oh-my-opencode-slim',
+      version: packageJson.version,
+    },
+  };
+}
 
 class AcpClient {
   private child: ChildProcessWithoutNullStreams;
@@ -86,14 +98,7 @@ class AcpClient {
   }
 
   async run(prompt: string): Promise<string> {
-    const init = await this.request('initialize', {
-      protocolVersion: 1,
-      clientCapabilities: {},
-      clientInfo: {
-        name: 'oh-my-opencode-slim',
-        title: 'oh-my-opencode-slim ACP bridge',
-      },
-    });
+    const init = await this.request('initialize', createAcpInitializeParams());
     this.authMethods = readAuthMethods(init);
     const created = await this.newSession();
     const sessionId = readSessionId(created);
@@ -306,7 +311,7 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
       if (!cwd) throw new Error('acp_run requires a working directory');
 
       await ctx.ask({
-        permission: 'bash',
+        permission: 'acp_run',
         patterns: [`${config.command} ${config.args.join(' ')}`.trim()],
         always: [],
         metadata: {
@@ -324,7 +329,7 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
         async (title, metadata) => {
           if (config.permissionMode === 'reject') return;
           await ctx.ask({
-            permission: 'bash',
+            permission: 'acp_run',
             patterns: [`acp:${args.agent}:${title}`],
             always: [],
             metadata,

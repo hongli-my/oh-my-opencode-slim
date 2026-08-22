@@ -1,27 +1,35 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { DEFAULT_MODELS, type PluginConfig } from '../config';
+import { RuntimeConfig } from '../config/runtime';
 import { createAgents, getAgentConfigs } from './index';
+
+const TEST_DIRECTORY = 'runtime-test-agents-custom';
+function runtimeFor(config: PluginConfig | undefined = {}) {
+  RuntimeConfig.reset(TEST_DIRECTORY);
+  RuntimeConfig.init(TEST_DIRECTORY, config ?? {});
+  return RuntimeConfig.get(TEST_DIRECTORY);
+}
 
 describe('custom-agent creation', () => {
   test('infers custom agents from unknown keys', () => {
     const config: PluginConfig = {
       agents: {
-        explorer: { model: 'openai/gpt-5.4-mini' },
+        explorer: { model: 'openai/gpt-5.6-luna' },
         reviewer: {
-          model: 'openai/gpt-5.5',
+          model: 'openai/gpt-5.6',
           prompt: 'You are the custom reviewer agent.',
         },
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const names = agents.map((agent) => agent.name);
 
     expect(names).toContain('reviewer');
 
     const customAgent = agents.find((agent) => agent.name === 'reviewer');
     expect(customAgent).toBeDefined();
-    expect(customAgent?.config.model).toBe('openai/gpt-5.5');
+    expect(customAgent?.config.model).toBe('openai/gpt-5.6');
     expect(customAgent?.config.prompt).toBe(
       'You are the custom reviewer agent.',
     );
@@ -31,7 +39,7 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         'test-auditor': {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
           prompt: 'You are a custom subagent for auditing.',
           orchestratorPrompt:
             '@test-auditor\n- Role: Compliance audit specialist',
@@ -39,7 +47,7 @@ describe('custom-agent creation', () => {
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const customAgent = agents.find((agent) => agent.name === 'test-auditor');
 
     expect(customAgent).toBeDefined();
@@ -66,7 +74,7 @@ describe('custom-agent creation', () => {
         },
       };
 
-      const agentDefs = createAgents(config);
+      const agentDefs = createAgents(runtimeFor(config));
       expect(
         agentDefs.find((agent) => agent.name === 'janitor'),
       ).toBeUndefined();
@@ -83,17 +91,17 @@ describe('custom-agent creation', () => {
       disabled_agents: ['test-auditor', 'designer'],
       agents: {
         'test-auditor': {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
           prompt: 'You are a disabled custom agent.',
         },
       },
     };
 
-    const agentDefs = createAgents(config);
+    const agentDefs = createAgents(runtimeFor(config));
     const names = agentDefs.map((agent) => agent.name);
     expect(names).not.toContain('test-auditor');
 
-    const sdkConfigs = getAgentConfigs(config);
+    const sdkConfigs = getAgentConfigs(runtimeFor(config));
     expect(sdkConfigs['test-auditor']).toBeUndefined();
   });
 
@@ -101,25 +109,25 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         'unsafe/name': {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
         },
       },
     };
 
-    expect(() => createAgents(config)).toThrow();
+    expect(() => createAgents(runtimeFor(config))).toThrow();
   });
 
   test('accepts arbitrary orchestratorPrompt text for custom agents', () => {
     const config: PluginConfig = {
       agents: {
         janitor: {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
           orchestratorPrompt: '@cleanup\n- Role: Cleanup specialist',
         },
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const orchestrator = agents.find((agent) => agent.name === 'orchestrator');
     expect(orchestrator?.config.prompt).toContain(
       '@cleanup\n- Role: Cleanup specialist',
@@ -136,18 +144,18 @@ describe('custom-agent creation', () => {
           timeoutMs: 0,
           permissionMode: 'ask',
           description: 'Claude Code research via ACP',
-          wrapperModel: 'openai/gpt-5.4-mini',
+          wrapperModel: 'openai/gpt-5.6-luna',
         },
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const wrapper = agents.find((agent) => agent.name === 'claude-research');
     const orchestrator = agents.find((agent) => agent.name === 'orchestrator');
 
     expect(wrapper).toBeDefined();
     expect(wrapper?.description).toBe('Claude Code research via ACP');
-    expect(wrapper?.config.model).toBe('openai/gpt-5.4-mini');
+    expect(wrapper?.config.model).toBe('openai/gpt-5.6-luna');
     expect(wrapper?.config.prompt).toContain('acp_run');
     expect(orchestrator?.config.prompt).toContain('@claude-research');
   });
@@ -157,11 +165,11 @@ describe('custom-agent creation', () => {
       preset: 'opencode-go',
       presets: {
         'opencode-go': {
-          orchestrator: { model: 'opencode-go/glm-5.1' },
+          orchestrator: { model: 'opencode-go/glm-5.2' },
         },
       },
       agents: {
-        orchestrator: { model: 'opencode-go/glm-5.1' },
+        orchestrator: { model: 'opencode-go/glm-5.2' },
       },
       acpAgents: {
         bridge: {
@@ -174,10 +182,10 @@ describe('custom-agent creation', () => {
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const wrapper = agents.find((agent) => agent.name === 'bridge');
 
-    expect(wrapper?.config.model).toBe('opencode-go/glm-5.1');
+    expect(wrapper?.config.model).toBe('opencode-go/glm-5.2');
   });
 
   test('falls back to oracle model for ACP wrappers', () => {
@@ -203,7 +211,7 @@ describe('custom-agent creation', () => {
         },
       };
 
-      const agents = createAgents(config);
+      const agents = createAgents(runtimeFor(config));
       const wrapper = agents.find((agent) => agent.name === 'bridge');
 
       expect(wrapper?.config.model).toBe(DEFAULT_MODELS.oracle);
@@ -217,7 +225,7 @@ describe('custom-agent creation', () => {
   test('rejects acpAgents that conflict with custom agents', () => {
     const config: PluginConfig = {
       agents: {
-        bridge: { model: 'openai/gpt-5.4-mini' },
+        bridge: { model: 'openai/gpt-5.6-luna' },
       },
       acpAgents: {
         bridge: {
@@ -230,7 +238,7 @@ describe('custom-agent creation', () => {
       },
     };
 
-    expect(() => createAgents(config)).toThrow(
+    expect(() => createAgents(runtimeFor(config))).toThrow(
       "ACP agent 'bridge' conflicts with a custom agent of the same name",
     );
   });
@@ -248,7 +256,7 @@ describe('custom-agent creation', () => {
       },
     };
 
-    expect(() => createAgents(config)).toThrow(
+    expect(() => createAgents(runtimeFor(config))).toThrow(
       "ACP agent 'fixer' conflicts with a built-in agent name or alias",
     );
   });
@@ -257,11 +265,11 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         explorer: {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
           displayName: 'fancy-explorer',
         },
         janitor: {
-          model: 'openai/gpt-5.5',
+          model: 'openai/gpt-5.6',
           orchestratorPrompt:
             'Please use @janitor to clean up after @explorer has completed.',
         },
@@ -279,7 +287,7 @@ describe('custom-agent creation', () => {
       },
     };
 
-    const agents = createAgents(config);
+    const agents = createAgents(runtimeFor(config));
     const orchestrator = agents.find((agent) => agent.name === 'orchestrator');
     const prompt = orchestrator?.config.prompt ?? '';
 
@@ -314,7 +322,7 @@ describe('custom-agent creation', () => {
     const configOnlyAcp: PluginConfig = {
       agents: {
         explorer: {
-          model: 'openai/gpt-5.4-mini',
+          model: 'openai/gpt-5.6-luna',
           displayName: 'fancy-explorer',
         },
       },
@@ -331,7 +339,7 @@ describe('custom-agent creation', () => {
       },
     };
 
-    const agentsOnlyAcp = createAgents(configOnlyAcp);
+    const agentsOnlyAcp = createAgents(runtimeFor(configOnlyAcp));
     const orchestratorOnlyAcp = agentsOnlyAcp.find(
       (agent) => agent.name === 'orchestrator',
     );
@@ -341,5 +349,162 @@ describe('custom-agent creation', () => {
     expect(promptOnlyAcp).toContain(
       'Please delegate research tasks to @claude-research or @fancy-explorer.',
     );
+  });
+});
+
+describe('custom-agent permission passthrough', () => {
+  test('passes user permission through to agent config', () => {
+    const config: PluginConfig = {
+      agents: {
+        planner: {
+          model: 'openai/gpt-5.5',
+          permission: { edit: 'deny', bash: 'ask' },
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const planner = agents.find((a) => a.name === 'planner');
+
+    expect(planner).toBeDefined();
+    expect(planner?.config.permission).toMatchObject({
+      edit: 'deny',
+      bash: 'ask',
+    });
+  });
+
+  test('applies permission to built-in agent overrides', () => {
+    const config: PluginConfig = {
+      agents: {
+        explorer: {
+          model: 'openai/gpt-5.5',
+          permission: { edit: 'deny' },
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const explorer = agents.find((a) => a.name === 'explorer');
+
+    expect(explorer).toBeDefined();
+    expect(explorer?.config.permission).toMatchObject({
+      edit: 'deny',
+    });
+  });
+
+  test('user edit/bash survive merge with skills config', () => {
+    const config: PluginConfig = {
+      agents: {
+        planner: {
+          model: 'openai/gpt-5.5',
+          skills: ['my-skill'],
+          permission: { edit: 'deny', bash: 'ask' },
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const planner = agents.find((a) => a.name === 'planner');
+
+    expect(planner).toBeDefined();
+    // User-supplied keys survive
+    expect(planner?.config.permission).toMatchObject({
+      edit: 'deny',
+      bash: 'ask',
+    });
+    // Plugin generates skill rule (overrides any user skill key)
+    expect(
+      (planner?.config.permission as Record<string, unknown>)?.skill,
+    ).toBeDefined();
+  });
+
+  test('passes permission through unchanged without skills or mcps', () => {
+    const config: PluginConfig = {
+      agents: {
+        researcher: {
+          model: 'openai/gpt-5.5',
+          permission: { edit: 'deny', webfetch: 'allow' },
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const researcher = agents.find((a) => a.name === 'researcher');
+
+    expect(researcher).toBeDefined();
+    expect(researcher?.config.permission).toMatchObject({
+      edit: 'deny',
+      webfetch: 'allow',
+    });
+  });
+
+  test('no permission field means no regression', () => {
+    const config: PluginConfig = {
+      agents: {
+        reviewer: {
+          model: 'openai/gpt-5.5',
+          prompt: 'You are a reviewer.',
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const reviewer = agents.find((a) => a.name === 'reviewer');
+
+    expect(reviewer).toBeDefined();
+    // Plugin still generates its own permission keys (question, etc.)
+    expect(reviewer?.config.permission).toBeDefined();
+    // But no edit/bash keys since user didn't set them
+    expect(
+      (reviewer?.config.permission as Record<string, unknown>)?.edit,
+    ).toBeUndefined();
+  });
+});
+
+describe('permission edge cases', () => {
+  test('shorthand string permission is not corrupted by applyDefaultPermissions', () => {
+    const config: PluginConfig = {
+      agents: {
+        planner: {
+          model: 'openai/gpt-5.5',
+          permission: 'ask',
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const planner = agents.find((a) => a.name === 'planner');
+
+    expect(planner).toBeDefined();
+    // The shorthand string should be preserved as-is, not spread into
+    // character keys like { "0": "a", "1": "s", "2": "k" }
+    expect(planner?.config.permission).toBe('ask');
+  });
+
+  test('orchestrator permission override does not replace plugin gates', () => {
+    const config: PluginConfig = {
+      agents: {
+        orchestrator: {
+          model: 'openai/gpt-5.5',
+          permission: { edit: 'deny' },
+        },
+      },
+    };
+
+    const agents = createAgents(runtimeFor(config));
+    const orchestrator = agents.find((a) => a.name === 'orchestrator');
+
+    expect(orchestrator).toBeDefined();
+    // User-supplied key survives
+    expect(orchestrator?.config.permission).toMatchObject({
+      edit: 'deny',
+    });
+    // Plugin-generated gates are NOT dropped by the override
+    expect(
+      (orchestrator?.config.permission as Record<string, unknown>)?.question,
+    ).toBeDefined();
+    expect(
+      (orchestrator?.config.permission as Record<string, unknown>)?.task_cancel,
+    ).toBeDefined();
   });
 });

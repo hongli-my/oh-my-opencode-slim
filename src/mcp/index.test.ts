@@ -6,7 +6,6 @@ describe('createBuiltinMcps', () => {
     const mcps = createBuiltinMcps();
     const names = Object.keys(mcps);
 
-    expect(names).toContain('websearch');
     expect(names).toContain('context7');
     expect(names).toContain('gh_grep');
   });
@@ -15,33 +14,30 @@ describe('createBuiltinMcps', () => {
     const mcps = createBuiltinMcps([]);
     const names = Object.keys(mcps);
 
-    expect(names.length).toBe(3);
-    expect(names).toContain('websearch');
+    expect(names.length).toBe(2);
     expect(names).toContain('context7');
     expect(names).toContain('gh_grep');
   });
 
   test('excludes single disabled MCP', () => {
-    const mcps = createBuiltinMcps(['websearch']);
+    const mcps = createBuiltinMcps(['gh_grep']);
     const names = Object.keys(mcps);
 
-    expect(names).not.toContain('websearch');
+    expect(names).not.toContain('gh_grep');
     expect(names).toContain('context7');
-    expect(names).toContain('gh_grep');
   });
 
   test('excludes multiple disabled MCPs', () => {
-    const mcps = createBuiltinMcps(['websearch', 'gh_grep']);
+    const mcps = createBuiltinMcps(['gh_grep', 'context7']);
     const names = Object.keys(mcps);
 
-    expect(names).not.toContain('websearch');
     expect(names).not.toContain('gh_grep');
-    expect(names).toContain('context7');
-    expect(names.length).toBe(1);
+    expect(names).not.toContain('context7');
+    expect(names.length).toBe(0);
   });
 
   test('excludes all MCPs when all disabled', () => {
-    const mcps = createBuiltinMcps(['websearch', 'context7', 'gh_grep']);
+    const mcps = createBuiltinMcps(['context7', 'gh_grep']);
     const names = Object.keys(mcps);
 
     expect(names.length).toBe(0);
@@ -52,8 +48,7 @@ describe('createBuiltinMcps', () => {
     const names = Object.keys(mcps);
 
     // All valid MCPs should still be present
-    expect(names.length).toBe(3);
-    expect(names).toContain('websearch');
+    expect(names.length).toBe(2);
     expect(names).toContain('context7');
     expect(names).toContain('gh_grep');
   });
@@ -70,14 +65,6 @@ describe('createBuiltinMcps', () => {
     }
   });
 
-  test('websearch MCP has correct structure', () => {
-    const mcps = createBuiltinMcps();
-    const websearch = mcps.websearch;
-
-    expect(websearch).toBeDefined();
-    expect('url' in websearch).toBe(true);
-  });
-
   test('context7 MCP has correct structure', () => {
     const mcps = createBuiltinMcps();
     const context7 = mcps.context7;
@@ -92,5 +79,16 @@ describe('createBuiltinMcps', () => {
 
     expect(gh_grep).toBeDefined();
     expect('url' in gh_grep).toBe(true);
+  });
+
+  test('never throws when disabledMcps is not an array', () => {
+    // Regression test: a malformed/non-array config.disabled_mcps value
+    // must degrade to "nothing disabled" instead of crashing plugin init.
+    const mcps = createBuiltinMcps('' as any);
+    const names = Object.keys(mcps);
+
+    expect(names.length).toBe(2);
+    expect(names).toContain('context7');
+    expect(names).toContain('gh_grep');
   });
 });

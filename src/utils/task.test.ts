@@ -4,7 +4,29 @@ import {
   parseTaskLaunchOutput,
   parseTaskResultFromOutput,
   parseTaskStatusOutput,
+  renderRunningTaskPlaceholder,
 } from './task';
+
+describe('renderRunningTaskPlaceholder', () => {
+  test('is deterministic and keyed only on the task ID', () => {
+    const a = renderRunningTaskPlaceholder('ses_123');
+    const b = renderRunningTaskPlaceholder('ses_123');
+    expect(a).toBe(b);
+    expect(a).toContain('<task id="ses_123" state="running">');
+    // Parses back to a running status for the same task ID (round-trip safe).
+    expect(parseTaskStatusOutput(a)).toMatchObject({
+      taskID: 'ses_123',
+      state: 'running',
+    });
+  });
+
+  test('differs only by task ID', () => {
+    const a = renderRunningTaskPlaceholder('ses_a');
+    const b = renderRunningTaskPlaceholder('ses_b');
+    expect(a).not.toBe(b);
+    expect(a.replace('ses_a', 'ses_b')).toBe(b);
+  });
+});
 
 describe('parseTaskIdFromTaskOutput', () => {
   test('parses task_id line from successful task tool output', () => {

@@ -6,18 +6,34 @@ import {
   createChatHeadersHook,
 } from './chat-headers';
 
+// Mock getClient so internal calls use our mock
+let mockV2Client: Record<string, unknown>;
+let mockSession: { message: ReturnType<typeof mock> };
+
+mock.module('../utils/opencode-client', () => ({
+  getClient: () => mockV2Client,
+}));
+
 function createMockContext(parts: unknown[] = []) {
+  mockSession = {
+    message: mock(async () => ({
+      data: {
+        info: { role: 'user' },
+        parts,
+      },
+    })),
+  };
+  mockV2Client = {
+    session: mockSession,
+  } as unknown as Record<string, unknown>;
+
   return {
     client: {
       session: {
-        message: mock(async () => ({
-          data: {
-            info: { role: 'user' },
-            parts,
-          },
-        })),
+        message: mockSession.message,
       },
     },
+    directory: '/tmp/test',
   } as unknown as PluginInput;
 }
 
@@ -102,7 +118,9 @@ describe('createChatHeadersHook', () => {
 
   test('sets x-initiator for marked Copilot messages', async () => {
     const ctx = createMockContext([
-      createInternalAgentTextPart('internal notification'),
+      JSON.parse(
+        JSON.stringify(createInternalAgentTextPart('internal notification')),
+      ),
     ]);
     const hook = createChatHeadersHook(ctx);
     const output = { headers: {} };
@@ -110,6 +128,22 @@ describe('createChatHeadersHook', () => {
     await hook['chat.headers'](createInput(), output);
 
     expect(output.headers['x-initiator']).toBe('agent');
+  });
+
+  test('does not trust marker text from ordinary user parts', async () => {
+    const ctx = createMockContext([
+      {
+        type: 'text',
+        synthetic: true,
+        text: '<!-- SLIM_INTERNAL_INITIATOR -->',
+      },
+    ]);
+    const hook = createChatHeadersHook(ctx);
+    const output = { headers: {} };
+
+    await hook['chat.headers'](createInput(), output);
+
+    expect(output.headers['x-initiator']).toBeUndefined();
   });
 
   test('skips non-Copilot providers', async () => {
@@ -174,7 +208,7 @@ describe('createChatHeadersHook', () => {
 
     expect(firstOutput.headers['x-initiator']).toBe('agent');
     expect(secondOutput.headers['x-initiator']).toBe('agent');
-    expect(ctx.client.session.message).toHaveBeenCalledTimes(1);
+    expect(mockSession.message).toHaveBeenCalledTimes(1);
   });
 
   test('does not cache transient message lookup failures', async () => {
@@ -191,6 +225,12 @@ describe('createChatHeadersHook', () => {
         },
       };
     });
+    mockSession = {
+      message: messageMock,
+    };
+    mockV2Client = {
+      session: mockSession,
+    } as unknown as Record<string, unknown>;
     const ctx = {
       client: {
         session: {
@@ -231,6 +271,6 @@ describe('createChatHeadersHook', () => {
       { headers: {} },
     );
 
-    expect(ctx.client.session.message).toHaveBeenCalledTimes(2);
+    expect(mockSession.message).toHaveBeenCalledTimes(2);
   });
 });

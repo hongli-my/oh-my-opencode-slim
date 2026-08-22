@@ -1,36 +1,48 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { PluginInput } from '@opencode-ai/plugin';
 import type { InterviewConfig } from '../config';
 import {
   createInternalAgentTextPart,
-  hasInternalInitiatorMarker,
+  isInternalInitiatorPart,
   log,
 } from '../utils';
 import { parseModelReference } from '../utils/session';
 import {
   appendInterviewAnswers,
+  claimInterviewDocument,
   createInterviewDirectoryPath,
   createInterviewFilePath,
   DEFAULT_OUTPUT_FOLDER,
   ensureInterviewFile,
   extractSummarySection,
   extractTitle,
+  InterviewDocumentOwnershipError,
   normalizeOutputFolder,
   parseSpecBlocks,
   readInterviewDocument,
   relativeInterviewPath,
   resolveExistingInterviewPath,
   rewriteInterviewDocument,
-  slugify,
+  rewriteInterviewDocumentWithFinalSpec,
+  withInterviewDocumentLock,
 } from './document';
-import { buildFallbackState, findLatestAssistantState } from './parser';
+import {
+  buildFallbackState,
+  findLatestAssistantState,
+  flattenMessage,
+} from './parser';
 import {
   buildAnswerPrompt,
   buildKickoffPrompt,
   buildResumePrompt,
 } from './prompts';
+import {
+  createV1InterviewSessionRuntime,
+  type InterviewSessionRuntime,
+} from './runtime';
 import type {
   InterviewAnswer,
   InterviewFileItem,
@@ -42,6 +54,14 @@ import type {
 
 const COMMAND_NAME = 'interview';
 const DEFAULT_MAX_QUESTIONS = 2;
+
+/**
+ * Cap on retained abandoned interview records. Abandoned interviews are kept
+ * briefly so a still-open browser tab can render their final state, but
+ * without a bound the `interviewsById` and `browserOpened` collections grow
+ * for the life of a long-running session/dashboard process.
+ */
+export const MAX_RETAINED_ABANDONED = 50;
 
 function isTruthyEnvFlag(value: string | undefined): boolean {
   if (!value) {
@@ -114,6 +134,7 @@ export function createInterviewService(
   deps?: {
     openBrowser?: (url: string) => void;
     env?: NodeJS.ProcessEnv;
+    runtime?: InterviewSessionRuntime;
   },
 ): {
   setBaseUrlResolver: (resolver: () => Promise<string>) => void;
@@ -127,7 +148,14 @@ export function createInterviewService(
   registerCommand: (config: Record<string, unknown>) => void;
   handleCommandExecuteBefore: (
     input: { command: string; sessionID: string; arguments: string },
-    output: { parts: Array<{ type: string; text?: string }> },
+    output: {
+      parts: Array<{
+        type: string;
+        text?: string;
+        synthetic?: boolean;
+        metadata?: Record<string, unknown>;
+      }>;
+    },
   ) => Promise<void>;
   handleEvent: (input: {
     event: { type: string; properties?: Record<string, unknown> };
@@ -159,6 +187,7 @@ export function createInterviewService(
     deps?.env ?? process.env,
   );
   const browserOpener = deps?.openBrowser ?? openBrowser;
+  const sessionRuntime = deps?.runtime ?? createV1InterviewSessionRuntime(ctx);
   const activeInterviewIds = new Map<string, string>();
   const interviewsById = new Map<string, InterviewRecord>();
   const activeSyncs = new Map<string, Promise<InterviewState>>();
@@ -170,7 +199,9 @@ export function createInterviewService(
     | ((interviewId: string, state: InterviewState) => void)
     | null = null;
   let onInterviewCreated: ((interview: InterviewRecord) => void) | null = null;
-  let idCounter = 0;
+  let abandonedOrderCounter = 0;
+  const finalizationPending = new Set<string>();
+  const finalizationReady = new Set<string>();
 
   function setBaseUrlResolver(resolver: () => Promise<string>): void {
     resolveBaseUrl = resolver;
@@ -210,55 +241,8 @@ export function createInterviewService(
     browserOpener(url);
   }
 
-  async function maybeRenameWithTitle(
-    interview: InterviewRecord,
-    assistantTitle: string | undefined,
-  ): Promise<void> {
-    if (!assistantTitle) {
-      return;
-    }
-    const newSlug = slugify(assistantTitle);
-    if (!newSlug) {
-      return;
-    }
-
-    const currentFileName = path.basename(interview.markdownPath, '.md');
-    // If already matches (or user-provided idea matches), skip
-    if (currentFileName === newSlug) {
-      return;
-    }
-
-    const dir = path.dirname(interview.markdownPath);
-    const newPath = path.join(dir, `${newSlug}.md`);
-
-    // Don't overwrite existing files
-    try {
-      await fs.access(newPath);
-      // File exists, don't rename
-      return;
-    } catch {
-      // File doesn't exist, safe to rename
-    }
-
-    try {
-      await fs.rename(interview.markdownPath, newPath);
-      interview.markdownPath = newPath;
-      log('[interview] renamed file with assistant title:', {
-        from: currentFileName,
-        to: newSlug,
-      });
-    } catch (error) {
-      log('[interview] failed to rename file:', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
   async function loadMessages(sessionID: string): Promise<InterviewMessage[]> {
-    const result = await ctx.client.session.messages({
-      path: { id: sessionID },
-    });
-    return result.data as InterviewMessage[];
+    return sessionRuntime.messages(sessionID);
   }
 
   async function loadMessagesWithRetry(
@@ -278,13 +262,45 @@ export function createInterviewService(
   }
 
   function isUserVisibleMessage(message: InterviewMessage): boolean {
-    return !(message.parts ?? []).some((part) =>
-      hasInternalInitiatorMarker(part),
-    );
+    return !(message.parts ?? []).some((part) => isInternalInitiatorPart(part));
   }
 
   function getInterviewById(interviewId: string): InterviewRecord | null {
     return interviewsById.get(interviewId) ?? null;
+  }
+
+  /**
+   * Mark an interview abandoned and prune the oldest abandoned records so the
+   * in-memory registry (and its browser-open tracking) stays bounded.
+   */
+  function abandonInterview(interview: InterviewRecord): void {
+    if (interview.status !== 'abandoned') {
+      interview.abandonedAt = nowIso();
+      interview.abandonedOrder = ++abandonedOrderCounter;
+    }
+    interview.status = 'abandoned';
+    pruneAbandonedInterviews();
+  }
+
+  function pruneAbandonedInterviews(): void {
+    const abandoned = [...interviewsById.values()].filter(
+      (record) => record.status === 'abandoned',
+    );
+    const overflow = abandoned.length - MAX_RETAINED_ABANDONED;
+    if (overflow <= 0) return;
+    abandoned
+      .sort((a, b) => {
+        const timeDelta =
+          new Date(a.abandonedAt ?? a.createdAt).getTime() -
+          new Date(b.abandonedAt ?? b.createdAt).getTime();
+        if (timeDelta !== 0) return timeDelta;
+        return (a.abandonedOrder ?? 0) - (b.abandonedOrder ?? 0);
+      })
+      .slice(0, overflow)
+      .forEach((record) => {
+        interviewsById.delete(record.id);
+        browserOpened.delete(record.id);
+      });
   }
 
   async function createInterview(
@@ -300,22 +316,30 @@ export function createInterviewService(
           return active;
         }
 
-        active.status = 'abandoned';
+        abandonInterview(active);
       }
     }
 
     const messages = await loadMessages(sessionID);
+    const uniqueId = randomUUID();
     const record: InterviewRecord = {
-      id: `${Date.now()}-${++idCounter}-${slugify(idea) || 'interview'}`,
+      id: uniqueId,
       sessionID,
       idea: normalizedIdea,
-      markdownPath: createInterviewFilePath(ctx.directory, outputFolder, idea),
+      markdownPath: createInterviewFilePath(
+        ctx.directory,
+        outputFolder,
+        idea,
+        uniqueId,
+      ),
       createdAt: nowIso(),
       status: 'active',
       baseMessageCount: messages.length,
     };
 
-    await ensureInterviewFile(record);
+    await withInterviewDocumentLock(record.markdownPath, () =>
+      ensureInterviewFile(record),
+    );
     activeInterviewIds.set(sessionID, record.id);
     interviewsById.set(record.id, record);
     fileCache = null;
@@ -338,15 +362,19 @@ export function createInterviewService(
           return active;
         }
 
-        active.status = 'abandoned';
+        abandonInterview(active);
       }
     }
 
-    const document = await fs.readFile(markdownPath, 'utf8');
     const messages = await loadMessages(sessionID);
+    const document = await claimInterviewDocument(
+      markdownPath,
+      sessionID,
+      messages.length,
+    );
     const title = extractTitle(document);
     const record: InterviewRecord = {
-      id: `${Date.now()}-${++idCounter}-${slugify(path.basename(markdownPath, '.md')) || 'interview'}`,
+      id: randomUUID(),
       sessionID,
       idea: title || path.basename(markdownPath, '.md'),
       markdownPath,
@@ -385,24 +413,52 @@ export function createInterviewService(
     const interviewMessages = allMessages
       .slice(interview.baseMessageCount)
       .filter(isUserVisibleMessage);
-    const parsed = findLatestAssistantState(interviewMessages, maxQuestions);
-    const existingDocument = await readInterviewDocument(interview);
-    const fallbackState = buildFallbackState(interviewMessages);
-    const state = parsed.state ?? {
-      ...fallbackState,
-      summary: extractSummarySection(existingDocument) || fallbackState.summary,
-    };
+    const latestAssistant = [...interviewMessages]
+      .reverse()
+      .find((message) => message.info?.role === 'assistant');
+    const latestAssistantText = latestAssistant
+      ? flattenMessage(latestAssistant)
+      : '';
+    const isCleanFinalResponse =
+      finalizationPending.has(interview.id) &&
+      finalizationReady.has(interview.id) &&
+      latestAssistantText.length > 0 &&
+      !/<interview_state>/i.test(latestAssistantText);
+    const parsed = isCleanFinalResponse
+      ? { state: null, latestAssistantError: undefined }
+      : findLatestAssistantState(interviewMessages, maxQuestions);
+    const synced = await withInterviewDocumentLock(
+      interview.markdownPath,
+      async () => {
+        const existingDocument = await readInterviewDocument(interview);
+        const fallbackState = buildFallbackState(interviewMessages);
+        const state = parsed.state ?? {
+          ...fallbackState,
+          summary:
+            extractSummarySection(existingDocument) || fallbackState.summary,
+        };
 
-    // Rename file if assistant provided a title (and file hasn't been renamed yet)
-    await maybeRenameWithTitle(interview, state.title);
+        let document: string;
+        if (isCleanFinalResponse) {
+          document = await rewriteInterviewDocumentWithFinalSpec(
+            interview,
+            latestAssistantText,
+          );
+          finalizationPending.delete(interview.id);
+        } else if (parsed.state) {
+          document = await rewriteInterviewDocument(
+            interview,
+            state.summary,
+            state.title,
+          );
+        } else {
+          document = await readInterviewDocument(interview);
+        }
 
-    // Skip rewrite when parsed.state is null — agent already wrote the final spec
-    let document: string;
-    if (parsed.state) {
-      document = await rewriteInterviewDocument(interview, state.summary);
-    } else {
-      document = await readInterviewDocument(interview);
-    }
+        return { document, state };
+      },
+    );
+    const { document, state } = synced;
     const blocks = parseSpecBlocks(document);
 
     const interviewState: InterviewState = {
@@ -453,25 +509,17 @@ export function createInterviewService(
     // Auto-open browser on initial creation (not on every poll/refresh)
     maybeOpenBrowser(interview.id, url);
 
-    await ctx.client.session.prompt({
-      path: { id: sessionID },
-      body: {
-        noReply: true,
-        parts: [
-          {
-            type: 'text',
-            text: [
-              '⎔ Interview UI ready',
-              '',
-              `Open: ${url}`,
-              `Document: ${relativeInterviewPath(ctx.directory, interview.markdownPath)}`,
-              '',
-              '[system status: continue without acknowledging this notification]',
-            ].join('\n'),
-          },
-        ],
-      },
-    });
+    await sessionRuntime.notify(
+      sessionID,
+      [
+        '⎔ Interview UI ready',
+        '',
+        `Open: ${url}`,
+        `Document: ${relativeInterviewPath(ctx.directory, interview.markdownPath)}`,
+        '',
+        '[system status: continue without acknowledging this notification]',
+      ].join('\n'),
+    );
   }
 
   function registerCommand(opencodeConfig: Record<string, unknown>): void {
@@ -565,19 +613,17 @@ export function createInterviewService(
         );
       }
 
-      await appendInterviewAnswers(interview, state.questions, answers);
+      await withInterviewDocumentLock(interview.markdownPath, () =>
+        appendInterviewAnswers(interview, state.questions, answers),
+      );
       const prompt = buildAnswerPrompt(answers, state.questions, maxQuestions);
 
-      // Use promptAsync for non-blocking — returns immediately, LLM
-      // processes in background. State push updates dashboard when done.
       const model = sessionModel.get(interview.sessionID);
-      await ctx.client.session.promptAsync({
-        path: { id: interview.sessionID },
-        body: {
-          parts: [createInternalAgentTextPart(prompt)],
-          ...(model ? { model: parseModelReference(model) ?? undefined } : {}),
-        },
-      });
+      await sessionRuntime.continue(
+        interview.sessionID,
+        prompt,
+        model ? (parseModelReference(model) ?? undefined) : undefined,
+      );
       promptSent = true;
     } finally {
       if (!promptSent) {
@@ -600,7 +646,7 @@ export function createInterviewService(
     if (!idea) {
       const activeId = activeInterviewIds.get(input.sessionID);
       const interview = activeId ? interviewsById.get(activeId) : null;
-      if (!interview || interview.status !== 'active') {
+      if (interview?.status !== 'active') {
         output.parts.push(
           createInternalAgentTextPart(
             'The user ran /interview without an idea. Ask them for the product idea in one sentence.',
@@ -624,7 +670,20 @@ export function createInterviewService(
       idea,
     );
     if (resumePath) {
-      const interview = await resumeInterview(input.sessionID, resumePath);
+      let interview: InterviewRecord;
+      try {
+        interview = await resumeInterview(input.sessionID, resumePath);
+      } catch (error) {
+        if (error instanceof InterviewDocumentOwnershipError) {
+          output.parts.push(
+            createInternalAgentTextPart(
+              'This interview document is already owned by another OpenCode session and cannot be resumed here.',
+            ),
+          );
+          return;
+        }
+        throw error;
+      }
       const document = await fs.readFile(interview.markdownPath, 'utf8');
       await notifyInterviewUrl(input.sessionID, interview);
       output.parts.push(
@@ -638,6 +697,14 @@ export function createInterviewService(
     output.parts.push(
       createInternalAgentTextPart(buildKickoffPrompt(idea, maxQuestions)),
     );
+
+    // best-effort: rename the session so it's identifiable in the session list.
+    // never block interview creation if the rename fails.
+    let sessionTitle = `Interview: ${idea}`;
+    if (sessionTitle.length > 50) {
+      sessionTitle = `${sessionTitle.slice(0, 49)}…`;
+    }
+    sessionRuntime.rename(input.sessionID, sessionTitle).catch(() => {});
   }
 
   async function handleEvent(input: {
@@ -651,6 +718,30 @@ export function createInterviewService(
       const status = properties.status as { type?: string } | undefined;
       if (sessionID) {
         sessionBusy.set(sessionID, status?.type === 'busy');
+        if (status?.type === 'idle') {
+          const interviewId = activeInterviewIds.get(sessionID);
+          if (interviewId && finalizationPending.has(interviewId)) {
+            finalizationReady.add(interviewId);
+          }
+        }
+      }
+      return;
+    }
+
+    if (
+      event.type === 'session.next.text.ended' ||
+      event.type === 'session.idle'
+    ) {
+      const sessionID =
+        (properties.sessionID as string | undefined) ??
+        (properties.info as { id?: string } | undefined)?.id ??
+        undefined;
+      if (sessionID) {
+        sessionBusy.set(sessionID, false);
+        const interviewId = activeInterviewIds.get(sessionID);
+        if (interviewId && finalizationPending.has(interviewId)) {
+          finalizationReady.add(interviewId);
+        }
       }
       return;
     }
@@ -689,13 +780,14 @@ export function createInterviewService(
       if (!interviewId) {
         return;
       }
+      finalizationReady.delete(interviewId);
 
       const interview = interviewsById.get(interviewId);
       if (!interview) {
         return;
       }
 
-      interview.status = 'abandoned';
+      abandonInterview(interview);
       fileCache = null;
       activeInterviewIds.delete(deletedSessionId);
       log('[interview] session deleted, interview marked abandoned', {
@@ -807,13 +899,11 @@ export function createInterviewService(
       ].join('\n');
 
       const model = sessionModel.get(interview.sessionID);
-      await ctx.client.session.promptAsync({
-        path: { id: interview.sessionID },
-        body: {
-          parts: [createInternalAgentTextPart(prompt)],
-          ...(model ? { model: parseModelReference(model) ?? undefined } : {}),
-        },
-      });
+      await sessionRuntime.continue(
+        interview.sessionID,
+        prompt,
+        model ? (parseModelReference(model) ?? undefined) : undefined,
+      );
       promptSent = true;
     } finally {
       if (!promptSent) {
@@ -863,19 +953,17 @@ export function createInterviewService(
         `The user sent a freeform message via the dashboard chat panel:`,
         `${message}`,
         ``,
-        `Process this request — it may be a request to add a new section, revise existing content, ask clarifying questions, or make structural changes.`,
+        `Process this request - it may be a request to add a new section, revise existing content, ask clarifying questions, or make structural changes.`,
         `Update the specification document accordingly and include the updated 11-section specification.`,
         `Ask up to ${maxQuestions} clarifying questions if needed using the same <interview_state> JSON block format as before.`,
       ].join('\n');
 
       const model = sessionModel.get(interview.sessionID);
-      await ctx.client.session.promptAsync({
-        path: { id: interview.sessionID },
-        body: {
-          parts: [createInternalAgentTextPart(prompt)],
-          ...(model ? { model: parseModelReference(model) ?? undefined } : {}),
-        },
-      });
+      await sessionRuntime.continue(
+        interview.sessionID,
+        prompt,
+        model ? (parseModelReference(model) ?? undefined) : undefined,
+      );
       promptSent = true;
     } finally {
       if (!promptSent) {
@@ -937,22 +1025,28 @@ export function createInterviewService(
           `The user confirmed the interview spec is complete.`,
           ``,
           `Produce a final, polished version of the full spec document.`,
-          `Do NOT include any <interview_state> block — just output the final spec as clean markdown.`,
+          `Do NOT include any <interview_state> block - just output the final spec as clean markdown.`,
           `The spec should be comprehensive, well-structured, and ready for implementation.`,
         ].join('\n');
       }
 
       const model = sessionModel.get(interview.sessionID);
-      await ctx.client.session.promptAsync({
-        path: { id: interview.sessionID },
-        body: {
-          parts: [createInternalAgentTextPart(prompt)],
-          ...(model ? { model: parseModelReference(model) ?? undefined } : {}),
-        },
-      });
+      if (action === 'confirm-complete') {
+        finalizationPending.add(interview.id);
+        finalizationReady.delete(interview.id);
+      }
+      await sessionRuntime.continue(
+        interview.sessionID,
+        prompt,
+        model ? (parseModelReference(model) ?? undefined) : undefined,
+      );
       promptSent = true;
     } finally {
       if (!promptSent) {
+        if (action === 'confirm-complete') {
+          finalizationPending.delete(interview.id);
+          finalizationReady.delete(interview.id);
+        }
         sessionBusy.set(interview.sessionID, false);
       }
     }

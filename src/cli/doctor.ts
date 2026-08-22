@@ -1,6 +1,10 @@
 import * as fs from 'node:fs';
 import { z } from 'zod';
-import { findPluginConfigPaths, mergePluginConfigs } from '../config/loader';
+import {
+  findPluginConfigPaths,
+  mergePluginConfigs,
+  normalizeDisabledArrayKeys,
+} from '../config/loader';
 import { type PluginConfig, PluginConfigSchema } from '../config/schema';
 import { stripJsonComments } from './config-io';
 
@@ -76,8 +80,16 @@ function checkConfigFile(
       };
     }
 
-    const content = fs.readFileSync(configPath, 'utf-8');
+    // Strip a UTF-8 BOM so a BOM-prefixed config is not misdiagnosed as
+    // invalid JSON (matches the loader's behavior).
+    const content = fs.readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, '');
     const rawConfig = JSON.parse(stripJsonComments(content));
+    // Normalize disabled_* keys exactly like the loader does before schema
+    // validation, so a string value (e.g. "explorer") is not diagnosed as a
+    // false invalid-schema error. Report each normalization to the user.
+    normalizeDisabledArrayKeys(rawConfig, (message) => {
+      console.warn(`[oh-my-opencode-slim] ${message}`);
+    });
     const parseResult = PluginConfigSchema.safeParse(rawConfig);
 
     if (!parseResult.success) {

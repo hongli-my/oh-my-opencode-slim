@@ -4,7 +4,9 @@
 
 import type { MultiplexerConfig, MultiplexerType } from '../config/schema';
 import { log } from '../utils/logger';
+import { CmuxMultiplexer } from './cmux';
 import { HerdrMultiplexer } from './herdr';
+import { KittyMultiplexer } from './kitty';
 import { TmuxMultiplexer } from './tmux';
 import type { Multiplexer } from './types';
 import { ZellijMultiplexer } from './zellij';
@@ -44,10 +46,25 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
       multiplexer = new HerdrMultiplexer(config.layout, config.main_pane_size);
       actualType = 'herdr';
       break;
+    case 'cmux':
+      multiplexer = new CmuxMultiplexer();
+      actualType = 'cmux';
+      break;
+    case 'kitty':
+      multiplexer = new KittyMultiplexer(config.layout, config.main_pane_size);
+      actualType = 'kitty';
+      break;
     case 'auto': {
       // Auto-detect based on environment variables only
       // Note: Does NOT fall back to binary availability checks
-      if (process.env.TMUX) {
+      if (
+        process.env.CMUX_SOCKET_PATH &&
+        process.env.CMUX_WORKSPACE_ID &&
+        process.env.CMUX_SURFACE_ID
+      ) {
+        multiplexer = new CmuxMultiplexer();
+        actualType = 'cmux';
+      } else if (process.env.TMUX) {
         multiplexer = new TmuxMultiplexer(config.layout, config.main_pane_size);
         actualType = 'tmux';
       } else if (process.env.ZELLIJ) {
@@ -58,11 +75,22 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
         );
         actualType = 'zellij';
       } else if (process.env.HERDR_ENV || process.env.HERDR_PANE_ID) {
+        // Check Herdr before kitty: kitty exports KITTY_PID to every child
+        // process, so a user running OpenCode inside kitty with Herdr active
+        // would otherwise silently resolve to kitty and fail every spawn
+        // (no KITTY_LISTEN_ON). Herdr's env vars are only set when Herdr is
+        // actually active, so this is safe to prefer.
         multiplexer = new HerdrMultiplexer(
           config.layout,
           config.main_pane_size,
         );
         actualType = 'herdr';
+      } else if (process.env.KITTY_PID || process.env.KITTY_WINDOW_ID) {
+        multiplexer = new KittyMultiplexer(
+          config.layout,
+          config.main_pane_size,
+        );
+        actualType = 'kitty';
       } else {
         // Not inside any session, disable multiplexer
         log('[multiplexer] auto: not inside any session, disabling');
@@ -78,30 +106,6 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
   log(`[multiplexer] Created ${actualType} instance`);
 
   return multiplexer;
-}
-
-/**
- * Clear the multiplexer cache (useful for testing)
- */
-export function clearMultiplexerCache(): void {
-  // No-op: multiplexers are no longer cached.
-}
-
-/**
- * Get the effective multiplexer type for auto mode
- * Returns the actual type that would be used (tmux/zellij/herdr/none)
- */
-export function getAutoMultiplexerType(): 'tmux' | 'zellij' | 'herdr' | 'none' {
-  if (process.env.TMUX) {
-    return 'tmux';
-  }
-  if (process.env.ZELLIJ) {
-    return 'zellij';
-  }
-  if (process.env.HERDR_ENV || process.env.HERDR_PANE_ID) {
-    return 'herdr';
-  }
-  return 'none';
 }
 
 /**

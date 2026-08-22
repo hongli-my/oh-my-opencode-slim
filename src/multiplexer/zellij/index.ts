@@ -3,10 +3,20 @@
  *
  * Creates panes for sub-agent sessions in Zellij.
  *
+ * Requires Zellij >= 0.44.1: `isAvailable()` parses `zellij --version` and
+ * rejects older releases whose CLI lacks the stable pane-id targeting used
+ * here (`rename-pane <name> -p <paneId>`, `write-chars <chars> -p <paneId>`,
+ * `list-panes --json --tab --all` with stable `tab_id`, and
+ * `new-pane --tab-id` for cross-tab targeting; `--tab-id` only exists in
+ * 0.44.1+). No `focus-pane` or `current-tab-info` calls are made — the former
+ * is invalid CLI syntax and the latter is client-bound and fails from pane
+ * child processes.
+ *
  * The default mode creates a dedicated "opencode-agents" tab:
  * - First sub-agent uses the default pane from new-tab
  * - Subsequent sub-agents create new panes
- * - User stays in their original tab
+ * - User stays in their original tab (resolved from the parent pane's
+ *   ZELLIJ_PANE_ID via list-panes)
  *
  * The optional "current-tab" mode creates panes in the tab containing the
  * parent OpenCode pane instead.
@@ -14,6 +24,12 @@
 
 import type { MultiplexerLayout, ZellijPaneMode } from '../../config/schema';
 import { crossSpawn } from '../../utils/compat';
+import {
+  buildOpencodeAttachCommand,
+  findBinary,
+  gracefulClosePane,
+  quoteShellArg,
+} from '../shared';
 import type { Multiplexer, PaneResult } from '../types';
 
 interface ZellijTabInfo {
@@ -35,13 +51,21 @@ export class ZellijMultiplexer implements Multiplexer {
   readonly type = 'zellij' as const;
 
   private binaryPath: string | null = null;
-  private hasChecked = false;
+  private availabilityPromise: Promise<boolean> | null = null;
   private agentTabId: string | null = null;
   private firstPaneId: string | null = null;
   private firstPaneUsed = false;
   private parentTabId: string | null = null;
+  private parentTabResolved = false;
   private readonly parentPaneId = process.env.ZELLIJ_PANE_ID;
   private readonly paneDirection: ZellijPaneDirection | null;
+  /**
+   * Serializes pane-creation sequences that may switch Zellij tabs or move
+   * client focus (new-tab, go-to-tab-by-id, new-pane). Concurrent spawns are
+   * chained so a cross-tab create cannot race another create's focus restore.
+   * Read-only queries (list-panes/list-tabs) never go through this queue.
+   */
+  private paneOpsChain: Promise<void> = Promise.resolve();
 
   constructor(
     layout: MultiplexerLayout = 'main-vertical',
@@ -55,12 +79,53 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   async isAvailable(): Promise<boolean> {
-    if (this.hasChecked) {
-      return this.binaryPath !== null;
+    // Cache the in-flight probe itself, not just the result: if availability
+    // is checked while the first probe is still running (e.g. an early
+    // sub-agent event racing the plugin's own startup check), the caller
+    // awaits the same promise instead of seeing hasChecked=true with
+    // binaryPath still null and wrongly concluding the backend is absent.
+    if (this.availabilityPromise) {
+      return this.availabilityPromise;
     }
-    this.binaryPath = await this.findBinary();
-    this.hasChecked = true;
-    return this.binaryPath !== null;
+    this.availabilityPromise = this.probeAvailability();
+    return this.availabilityPromise;
+  }
+
+  /**
+   * Resolve the zellij binary and gate on its version. Runs at most once per
+   * adapter instance (the promise is cached by isAvailable).
+   */
+  private async probeAvailability(): Promise<boolean> {
+    const binaryPath = await findBinary('zellij');
+    if (binaryPath && (await this.hasSupportedVersion(binaryPath))) {
+      this.binaryPath = binaryPath;
+      return true;
+    }
+    this.binaryPath = null;
+    return false;
+  }
+
+  /**
+   * Parse and gate on the installed Zellij version. The adapter relies on
+   * stable pane-id targeting that only exists in Zellij >= 0.44.1; older
+   * releases (or unparsable version output) make the backend unavailable.
+   */
+  private async hasSupportedVersion(path: string): Promise<boolean> {
+    const version = await this.readVersion(path);
+    return version !== null && isSupportedZellijVersion(version);
+  }
+
+  private async readVersion(path: string): Promise<ZellijVersion | null> {
+    try {
+      const proc = crossSpawn([path, '--version'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      if ((await proc.exited) !== 0) return null;
+      return parseZellijVersion(await proc.stdout());
+    } catch {
+      return null;
+    }
   }
 
   isInsideSession(): boolean {
@@ -68,6 +133,27 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   async spawnPane(
+    sessionId: string,
+    description: string,
+    serverUrl: string,
+    directory: string,
+  ): Promise<PaneResult> {
+    // The tab/focus-mutating creation sequence is queued so concurrent
+    // spawnPane calls cannot interleave (e.g. a cross-tab new-pane racing
+    // another create's focus restore). Binary discovery and availability
+    // probing happen inside the unlocked body too, which is fine: they are
+    // cached after the first call.
+    const run = this.paneOpsChain.then(() =>
+      this.spawnPaneUnlocked(sessionId, description, serverUrl, directory),
+    );
+    this.paneOpsChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async spawnPaneUnlocked(
     sessionId: string,
     description: string,
     serverUrl: string,
@@ -109,6 +195,8 @@ export class ZellijMultiplexer implements Multiplexer {
           this.firstPaneUsed = true;
           return { success: true, paneId: this.firstPaneId };
         }
+        // Reuse failed — don't keep retrying a known-bad pane
+        this.firstPaneUsed = true;
         // fall through to createPaneInAgentTab on failure
       }
 
@@ -140,58 +228,34 @@ export class ZellijMultiplexer implements Multiplexer {
     const paneName = description.slice(0, 30).replace(/"/g, '\\"');
     const targetTabId = await this.getParentTabId(zellij);
 
-    const args = [
-      'action',
-      'new-pane',
-      ...this.tabIdArgs(targetTabId),
-      ...this.directionArgs(),
-      '--name',
-      paneName,
-      '--close-on-exit',
-      '--',
-      'sh',
-      '-lc',
-      opencodeCmd,
-    ];
-
-    const proc = crossSpawn([zellij, ...args], {
-      stdout: 'pipe',
-      stderr: 'pipe',
+    return this.runNewPaneWithFallback(zellij, paneName, opencodeCmd, {
+      tabIdArgs: this.tabIdArgs(targetTabId),
     });
-
-    const exitCode = await proc.exited;
-    const stdout = await proc.stdout();
-    const paneId = stdout.trim();
-
-    if (exitCode === 0 && paneId?.startsWith('terminal_')) {
-      return { success: true, paneId };
-    }
-    return { success: false };
   }
 
-  private async createPaneInAgentTab(
+  /**
+   * Run `new-pane`, retrying once without the direction hint on failure.
+   *
+   * Zellij silently drops a `--direction` split once a tab is crowded (exit
+   * code 0 but no `terminal_*` id on stdout), so a failed directed create is
+   * retried without `--direction`, which lets Zellij place the pane in the
+   * largest free space. The retry keeps `--name`, `--close-on-exit`, and the
+   * command part — only the direction hint is dropped. Two failures (or one
+   * failure with no direction configured) report `{ success: false }`.
+   */
+  private async runNewPaneWithFallback(
     zellij: string,
-    sessionId: string,
-    serverUrl: string,
-    directory: string,
-    description: string,
+    paneName: string,
+    opencodeCmd: string,
+    opts: { tabIdArgs: string[] },
   ): Promise<PaneResult> {
-    const opencodeCmd = buildOpencodeAttachCommand(
-      sessionId,
-      serverUrl,
-      directory,
-    );
-    const paneName = description.slice(0, 30).replace(/"/g, '\\"');
-
-    const currentTabId = await this.getCurrentTabId(zellij);
-    const inAgentTab = currentTabId === this.agentTabId;
-
-    if (inAgentTab) {
-      // Already in agent tab, create pane directly
+    const direction = this.directionArgs();
+    const runOnce = async (directionArgs: string[]): Promise<PaneResult> => {
       const args = [
         'action',
         'new-pane',
-        ...this.directionArgs(),
+        ...opts.tabIdArgs,
+        ...directionArgs,
         '--name',
         paneName,
         '--close-on-exit',
@@ -215,14 +279,43 @@ export class ZellijMultiplexer implements Multiplexer {
         return { success: true, paneId };
       }
       return { success: false };
+    };
+
+    const first = await runOnce(direction);
+    if (first.success) return first;
+    // Retry only when a direction was actually applied; an undirected create
+    // already uses Zellij's free-space placement and would just repeat.
+    if (direction.length === 0) return first;
+    return runOnce([]);
+  }
+
+  private async createPaneInAgentTab(
+    zellij: string,
+    sessionId: string,
+    serverUrl: string,
+    directory: string,
+    description: string,
+  ): Promise<PaneResult> {
+    const opencodeCmd = buildOpencodeAttachCommand(
+      sessionId,
+      serverUrl,
+      directory,
+    );
+    const paneName = description.slice(0, 30).replace(/"/g, '\\"');
+
+    const parentTabId = await this.getParentTabId(zellij);
+    const inAgentTab = parentTabId === this.agentTabId;
+
+    if (inAgentTab) {
+      // Already in agent tab, create pane directly
+      return this.runNewPaneWithFallback(zellij, paneName, opencodeCmd, {
+        tabIdArgs: [],
+      });
     }
 
     if (!this.agentTabId) {
       return { success: false };
     }
-
-    // Get current tab before switching
-    const originalTab = await this.getCurrentTabId(zellij);
 
     // Switch to agent tab
     await crossSpawn([zellij, 'action', 'go-to-tab-by-id', this.agentTabId], {
@@ -231,32 +324,20 @@ export class ZellijMultiplexer implements Multiplexer {
     }).exited;
 
     // Create pane
-    const args = [
-      'action',
-      'new-pane',
-      ...this.directionArgs(),
-      '--name',
+    const result = await this.runNewPaneWithFallback(
+      zellij,
       paneName,
-      '--close-on-exit',
-      '--',
-      'sh',
-      '-lc',
       opencodeCmd,
-    ];
+      { tabIdArgs: [] },
+    );
 
-    const proc = crossSpawn([zellij, ...args], {
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-
-    const exitCode = await proc.exited;
-    const stdout = await proc.stdout();
-    const paneId = stdout.trim();
-
-    // Switch back to original tab
-    if (originalTab) {
+    // Switch back to the parent tab (the tab containing the OpenCode pane
+    // that spawned the sub-agent, resolved via ZELLIJ_PANE_ID). If the parent
+    // tab could not be located, leave focus in the agent tab rather than
+    // guessing.
+    if (parentTabId) {
       await crossSpawn(
-        [zellij, 'action', 'go-to-tab-by-id', String(originalTab)],
+        [zellij, 'action', 'go-to-tab-by-id', String(parentTabId)],
         {
           stdout: 'ignore',
           stderr: 'ignore',
@@ -264,11 +345,7 @@ export class ZellijMultiplexer implements Multiplexer {
       ).exited;
     }
 
-    // Accept success if exit code is 0 and we got a valid pane ID
-    if (exitCode === 0 && paneId?.startsWith('terminal_')) {
-      return { success: true, paneId };
-    }
-    return { success: false };
+    return result;
   }
 
   private async runInPane(
@@ -286,28 +363,39 @@ export class ZellijMultiplexer implements Multiplexer {
         directory,
       );
 
-      await crossSpawn([zellij, 'action', 'focus-pane', '--pane-id', paneId], {
-        stdout: 'ignore',
-        stderr: 'ignore',
-      }).exited;
-
-      await crossSpawn(
-        [zellij, 'action', 'rename-pane', '--name', description.slice(0, 30)],
+      // Rename is best-effort cosmetics: a rename failure must not mask a
+      // failing attach write, so its exit code is intentionally ignored.
+      const renameProc = crossSpawn(
+        [
+          zellij,
+          'action',
+          'rename-pane',
+          description.slice(0, 30),
+          '-p',
+          paneId,
+        ],
         { stdout: 'ignore', stderr: 'ignore' },
-      ).exited;
+      );
+      await renameProc.exited;
 
-      await crossSpawn(
-        [zellij, 'action', 'write-chars', buildShellLaunchCommand(opencodeCmd)],
-        {
-          stdout: 'ignore',
-          stderr: 'ignore',
-        },
-      ).exited;
+      const writeCmdProc = crossSpawn(
+        [
+          zellij,
+          'action',
+          'write-chars',
+          buildShellLaunchCommand(opencodeCmd),
+          '-p',
+          paneId,
+        ],
+        { stdout: 'ignore', stderr: 'ignore' },
+      );
+      if ((await writeCmdProc.exited) !== 0) return false;
 
-      await crossSpawn([zellij, 'action', 'write-chars', '\n'], {
-        stdout: 'ignore',
-        stderr: 'ignore',
-      }).exited;
+      const writeNewlineProc = crossSpawn(
+        [zellij, 'action', 'write-chars', '\n', '-p', paneId],
+        { stdout: 'ignore', stderr: 'ignore' },
+      );
+      if ((await writeNewlineProc.exited) !== 0) return false;
 
       return true;
     } catch {
@@ -317,7 +405,7 @@ export class ZellijMultiplexer implements Multiplexer {
 
   private async ensureAgentTab(
     zellij: string,
-  ): Promise<{ tabId: string; firstPaneId: string } | null> {
+  ): Promise<{ tabId: string; firstPaneId: string | null } | null> {
     try {
       // Try to find existing tab
       const existingTab = await this.findTabByName(zellij, 'opencode-agents');
@@ -328,12 +416,9 @@ export class ZellijMultiplexer implements Multiplexer {
         );
         return {
           tabId: existingTab.tabId,
-          firstPaneId: firstPane || 'terminal_0',
+          firstPaneId: firstPane,
         };
       }
-
-      // Get panes before creating tab
-      const beforePanes = await this.listPanes(zellij);
 
       // Create new tab
       const createProc = crossSpawn(
@@ -347,11 +432,42 @@ export class ZellijMultiplexer implements Multiplexer {
       const newTab = await this.findTabByName(zellij, 'opencode-agents');
       if (!newTab) return null;
 
-      // Get the new pane
-      const afterPanes = await this.listPanes(zellij);
-      const newPane = afterPanes.find((p) => !beforePanes.includes(p));
+      // Get the default pane in the new tab
+      const firstPane = await this.getFirstPaneInTab(zellij, newTab.tabId);
 
-      return { tabId: newTab.tabId, firstPaneId: newPane || 'terminal_0' };
+      // `new-tab` moves the attached client's focus to the new tab. Restore
+      // the parent tab (resolved via ZELLIJ_PANE_ID) so the user stays where
+      // they were, mirroring the restore done after pane creation. If the
+      // parent tab cannot be located, leave focus in the agent tab rather
+      // than guessing.
+      const parentTabId = await this.getParentTabId(zellij);
+      if (parentTabId) {
+        await crossSpawn(
+          [zellij, 'action', 'go-to-tab-by-id', String(parentTabId)],
+          {
+            stdout: 'ignore',
+            stderr: 'ignore',
+          },
+        ).exited;
+      }
+
+      return { tabId: newTab.tabId, firstPaneId: firstPane };
+    } catch {
+      return null;
+    }
+  }
+
+  private async listPanesJson(
+    zellij: string,
+  ): Promise<ZellijPaneInfo[] | null> {
+    try {
+      const proc = crossSpawn(
+        [zellij, 'action', 'list-panes', '--json', '--tab', '--all'],
+        { stdout: 'pipe', stderr: 'pipe' },
+      );
+      if ((await proc.exited) !== 0) return null;
+      const stdout = await proc.stdout();
+      return JSON.parse(stdout) as ZellijPaneInfo[];
     } catch {
       return null;
     }
@@ -361,26 +477,17 @@ export class ZellijMultiplexer implements Multiplexer {
     zellij: string,
     tabId: string,
   ): Promise<string | null> {
-    const originalTab = await this.getCurrentTabId(zellij);
-    await crossSpawn([zellij, 'action', 'go-to-tab-by-id', tabId], {
-      stdout: 'ignore',
-      stderr: 'ignore',
-    }).exited;
-
-    const panes = await this.listPanes(zellij);
-
-    // Restore original tab
-    if (originalTab) {
-      await crossSpawn(
-        [zellij, 'action', 'go-to-tab-by-id', String(originalTab)],
-        {
-          stdout: 'ignore',
-          stderr: 'ignore',
-        },
-      ).exited;
+    try {
+      const panes = await this.listPanesJson(zellij);
+      if (!panes) return null;
+      const pane = panes.find(
+        (candidate) =>
+          !candidate.is_plugin && candidate.tab_id === Number(tabId),
+      );
+      return pane ? `terminal_${pane.id}` : null;
+    } catch {
+      return null;
     }
-
-    return panes[0] || null;
   }
 
   private async findTabByName(
@@ -442,81 +549,14 @@ export class ZellijMultiplexer implements Multiplexer {
     }
   }
 
-  private async getCurrentTabId(zellij: string): Promise<string | null> {
-    try {
-      const proc = crossSpawn(
-        [zellij, 'action', 'current-tab-info', '--json'],
-        {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        },
-      );
-
-      const exitCode = await proc.exited;
-      if (exitCode !== 0) return null;
-
-      const stdout = await proc.stdout();
-      try {
-        const info = JSON.parse(stdout);
-        return String(info.tab_id);
-      } catch {
-        return null;
-      }
-    } catch {
-      return null;
-    }
-  }
-
-  private async listPanes(zellij: string): Promise<string[]> {
-    try {
-      const proc = crossSpawn([zellij, 'action', 'list-panes'], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-
-      const exitCode = await proc.exited;
-      if (exitCode !== 0) return [];
-
-      const stdout = await proc.stdout();
-      return stdout
-        .split('\n')
-        .slice(1)
-        .map((line) => line.trim().split(/\s+/)[0])
-        .filter((id) => id?.startsWith('terminal_'));
-    } catch {
-      return [];
-    }
-  }
-
   async closePane(paneId: string): Promise<boolean> {
-    if (!paneId || paneId === 'unknown') return true;
-
     const zellij = await this.getBinary();
-    if (!zellij) return false;
-
-    try {
-      // Send Ctrl+C for graceful shutdown
-      await crossSpawn(
-        [zellij, 'action', 'write', '--pane-id', paneId, '\u0003'],
-        {
-          stdout: 'ignore',
-          stderr: 'ignore',
-        },
-      ).exited;
-
-      await new Promise((r) => setTimeout(r, 250));
-
-      // Close the pane
-      const proc = crossSpawn(
-        [zellij, 'action', 'close-pane', '--pane-id', paneId],
-        { stdout: 'pipe', stderr: 'pipe' },
-      );
-
-      const exitCode = await proc.exited;
-      return exitCode === 0 || exitCode === 1;
-    } catch {
-      return false;
-    }
+    return gracefulClosePane(zellij, paneId, {
+      ctrlC: ['action', 'write', '--pane-id', paneId, '\u0003'],
+      close: ['action', 'close-pane', '--pane-id', paneId],
+      acceptExitCode1: true,
+      emptyPaneReturnsTrue: true,
+    });
   }
 
   async applyLayout(
@@ -537,18 +577,20 @@ export class ZellijMultiplexer implements Multiplexer {
   }
 
   private async getParentTabId(zellij: string): Promise<string | null> {
-    if (this.parentTabId) return this.parentTabId;
+    if (this.parentTabResolved) return this.parentTabId;
+    if (!this.parentPaneId) return null;
 
-    if (this.parentPaneId) {
-      const tabId = await this.findTabIdForPane(zellij, this.parentPaneId);
-      if (tabId) {
-        this.parentTabId = tabId;
-        return tabId;
-      }
+    const tabId = await this.findTabIdForPane(zellij, this.parentPaneId);
+    // Cache only a successful lookup. A failed query is not cached so a
+    // transient list-panes failure (e.g. early in the session) is retried on
+    // the next spawn instead of being permanently treated as "no parent tab".
+    // `current-tab-info` is deliberately not used: it is client-bound and
+    // fails from pane child processes.
+    if (tabId !== null) {
+      this.parentTabId = tabId;
+      this.parentTabResolved = true;
     }
-
-    this.parentTabId = await this.getCurrentTabId(zellij);
-    return this.parentTabId;
+    return tabId;
   }
 
   private async findTabIdForPane(
@@ -556,24 +598,13 @@ export class ZellijMultiplexer implements Multiplexer {
     paneId: string,
   ): Promise<string | null> {
     try {
-      const proc = crossSpawn(
-        [zellij, 'action', 'list-panes', '--json', '--tab', '--all'],
-        {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        },
-      );
-
-      if ((await proc.exited) !== 0) return null;
-
-      const stdout = await proc.stdout();
-      const panes: ZellijPaneInfo[] = JSON.parse(stdout);
+      const panes = await this.listPanesJson(zellij);
+      if (!panes) return null;
       const normalizedPaneId = normalizePaneId(paneId);
       const pane = panes.find(
         (candidate) =>
           !candidate.is_plugin && String(candidate.id) === normalizedPaneId,
       );
-
       return pane?.tab_id === undefined ? null : String(pane.tab_id);
     } catch {
       return null;
@@ -584,25 +615,41 @@ export class ZellijMultiplexer implements Multiplexer {
     await this.isAvailable();
     return this.binaryPath;
   }
-
-  private async findBinary(): Promise<string | null> {
-    const cmd = process.platform === 'win32' ? 'where' : 'which';
-    try {
-      const proc = crossSpawn([cmd, 'zellij'], {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      if ((await proc.exited) !== 0) return null;
-      const stdout = await proc.stdout();
-      return stdout.trim().split('\n')[0] || null;
-    } catch {
-      return null;
-    }
-  }
 }
 
 function normalizePaneId(paneId: string): string {
   return paneId.replace(/^terminal_/, '');
+}
+
+interface ZellijVersion {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/**
+ * Oldest Zellij release with the stable pane-id targeting this adapter relies
+ * on (`rename-pane <name> -p <paneId>`, `write-chars <chars> -p <paneId>`,
+ * `list-panes --json --tab --all` with stable `tab_id`, and
+ * `new-pane --tab-id` for cross-tab creation, which only exists in 0.44.1+).
+ */
+const MIN_ZELLIJ_VERSION: ZellijVersion = { major: 0, minor: 44, patch: 1 };
+
+function parseZellijVersion(output: string): ZellijVersion | null {
+  const match = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(output.trim());
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: match[3] === undefined ? 0 : Number(match[3]),
+  };
+}
+
+function isSupportedZellijVersion(version: ZellijVersion): boolean {
+  const min = MIN_ZELLIJ_VERSION;
+  if (version.major !== min.major) return version.major > min.major;
+  if (version.minor !== min.minor) return version.minor > min.minor;
+  return version.patch >= min.patch;
 }
 
 function getPaneDirection(
@@ -620,26 +667,6 @@ function getPaneDirection(
   }
 }
 
-function buildOpencodeAttachCommand(
-  sessionId: string,
-  serverUrl: string,
-  directory: string,
-): string {
-  return [
-    'opencode',
-    'attach',
-    quoteShellArg(serverUrl),
-    '--session',
-    quoteShellArg(sessionId),
-    '--dir',
-    quoteShellArg(directory),
-  ].join(' ');
-}
-
 function buildShellLaunchCommand(command: string): string {
   return ['sh', '-lc', quoteShellArg(command)].join(' ');
-}
-
-function quoteShellArg(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

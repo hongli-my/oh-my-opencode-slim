@@ -126,13 +126,13 @@ Osmani's framework identifies five primitives that compose a loop, plus durable 
 | Agent spawning | Yes | Yes | Yes (9 agents) |
 | Background execution | Yes | Yes | Yes (background jobs) |
 | Maker/checker split | Yes | Yes | Yes (orchestrator dispatches, specialists execute) |
-| Depth tracking | Yes | Yes | Yes (max 3 levels) |
+| Depth tracking | Yes | Yes | Native (OpenCode's subagent_depth) |
 | Session reuse | Yes | Yes | Yes (BackgroundJobBoard) |
 | Job tracking | Limited | Limited | Yes (Background Job Board with aliases) |
-| Cancellation | Yes | Yes | Yes (cancel_task tool) |
+| Cancellation | Yes | Yes | Yes (`task_cancel` tool) |
 | Parallel dispatch | Yes | Yes | Yes (explicit in orchestrator prompt) |
 
-**Verdict:** All three have sub-agent support. OpenCode's is the most structured with 9 specialized agents, a formal Background Job Board, session reuse, depth tracking, and a dedicated orchestrator that never implements directly.
+**Verdict:** All three have sub-agent support. OpenCode's is the most structured with 9 specialized agents, a formal Background Job Board, session reuse, and a dedicated orchestrator that never implements directly.
 
 ### Loop Engine (Iteration Primitive)
 
@@ -215,14 +215,14 @@ In its purest form, Ralph is a Bash loop. That's it.
 |----------------|--------|----------------|
 | **Skills** | Mature | 7 bundled skills, per-agent permissions, auto-sync |
 | **Connectors/MCP** | Mature | 3 built-in MCPs, per-agent permission system |
-| **Sub-agents** | Mature | 9 agents, Background Job Board, depth tracking, session reuse |
+| **Sub-agents** | Mature | 9 agents, Background Job Board, session reuse |
 | **Worktrees** | Skill-only | Orchestrator skill, apply-patch hook support |
 | **Automations** | Not implemented | Deferred to Phase 4 |
 | **Loop engine** | Spec only | Fully designed, not implemented |
 
 ### What's Designed But Not Built
 
-The loop engineering spec (`docs/superpowers/specs/2026-06-25-loop-engineering-runtime.md`) defines:
+The planned loop engineering runtime includes:
 
 - **LoopEngine** class with event-driven orchestration
 - **LoopSession** state machine (executing <-> verifying binary oscillation)
@@ -234,7 +234,7 @@ The loop engineering spec (`docs/superpowers/specs/2026-06-25-loop-engineering-r
 
 ### The Gap
 
-OpenCode has 3 of 5 building blocks fully wired (skills, connectors, sub-agents), worktrees as a skill, and automations + loop engine as unimplemented specs. The sub-agent infrastructure is the strongest piece - the Background Job Board, session reuse, and depth tracking are more structured than what Claude Code or Codex expose.
+OpenCode has 3 of 5 building blocks fully wired (skills, connectors, sub-agents), worktrees as a skill, and automations + loop engine as unimplemented specs. The sub-agent infrastructure is the strongest piece - the Background Job Board, session reuse, and native depth tracking are more structured than what Claude Code or Codex expose.
 
 The missing piece is the outer loop itself: the scheduler that runs on a timer, spawns work, and keeps going without human intervention. Once that lands (Phase 1-2 of the spec), OpenCode will have a complete loop engineering stack.
 

@@ -5,7 +5,7 @@ import { CUSTOM_SKILLS } from './custom-skills';
  * permission grants but is NOT installed by this plugin's CLI.
  */
 export interface PermissionOnlySkill {
-  /** Skill name — must match the name OpenCode uses for permission checks */
+  /** Skill name - must match the name OpenCode uses for permission checks */
   name: string;
   /** List of agents that should auto-allow this skill */
   allowedAgents: string[];
@@ -15,7 +15,7 @@ export interface PermissionOnlySkill {
 
 /**
  * Skills managed externally (not installed by this plugin's CLI).
- * Entries here only affect agent permission grants — nothing is installed.
+ * Entries here only affect agent permission grants - nothing is installed.
  */
 export const PERMISSION_ONLY_SKILLS: PermissionOnlySkill[] = [
   {
@@ -34,10 +34,12 @@ export const PERMISSION_ONLY_SKILLS: PermissionOnlySkill[] = [
  */
 export function getSkillPermissionsForAgent(
   agentName: string,
-  skillList?: string[],
-  disabledSkillNames?: string[],
+  skillList?: readonly string[],
+  disabledSkillNames?: readonly string[],
 ): Record<string, 'allow' | 'ask' | 'deny'> {
-  const disabledSkills = new Set(disabledSkillNames ?? []);
+  const disabledSkills = new Set(
+    Array.isArray(disabledSkillNames) ? disabledSkillNames : [],
+  );
 
   // Orchestrator gets all skills by default, others are restricted
   const permissions: Record<string, 'allow' | 'ask' | 'deny'> = {

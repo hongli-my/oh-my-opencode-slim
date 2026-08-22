@@ -10,6 +10,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { URL } from 'node:url';
+import type { PluginInput } from '@opencode-ai/plugin';
 import { log } from '../utils';
 import {
   extractSummarySection,
@@ -75,11 +76,11 @@ export async function readDashboardAuthFile(
       pid: number;
       startedAt: number;
     };
-    // Check if the PID is still alive — stale file from crashed dashboard
+    // Check if the PID is still alive - stale file from crashed dashboard
     try {
       process.kill(data.pid, 0); // signal 0 = existence check, no actual signal
     } catch {
-      // PID doesn't exist — stale auth file from crashed dashboard
+      // PID doesn't exist - stale auth file from crashed dashboard
       try {
         fsSync.unlinkSync(getAuthFilePath(port));
       } catch {
@@ -142,6 +143,13 @@ interface RegisteredSession {
   registeredAt: number;
 }
 
+type PendingKind = 'answers' | 'nudge' | 'block-comment' | 'chat';
+
+interface PendingClaim {
+  claimId: string;
+  kind: PendingKind;
+}
+
 // ─── Config ───────────────────────────────────────────────────────────
 
 export const DEFAULT_DASHBOARD_PORT = 43211;
@@ -149,14 +157,7 @@ export const DEFAULT_DASHBOARD_PORT = 43211;
 export interface DashboardConfig {
   port: number;
   outputFolder: string;
-  sessionClient?: {
-    list: (params?: Record<string, unknown>) => Promise<{
-      data?: Array<{
-        directory?: string;
-        time?: { updated?: number };
-      }>;
-    }>;
-  };
+  sessionClient?: Pick<PluginInput['client']['session'], 'list'>;
 }
 
 // ─── Dashboard Server ─────────────────────────────────────────────────
@@ -176,6 +177,32 @@ export function createDashboardServer(config: DashboardConfig): {
     questionId: string;
     answer: string;
   }> | null;
+  claimPendingAnswers: (interviewId: string) => {
+    claimId: string;
+    answers: Array<{ questionId: string; answer: string }>;
+  } | null;
+  claimNudgeAction: (interviewId: string) => {
+    claimId: string;
+    action: 'more-questions' | 'confirm-complete';
+  } | null;
+  claimBlockComment: (interviewId: string) => {
+    claimId: string;
+    comment: { section: string; comment: string };
+  } | null;
+  claimChatMessage: (interviewId: string) => {
+    claimId: string;
+    message: string;
+  } | null;
+  acknowledgePending: (
+    interviewId: string,
+    kind: PendingKind,
+    claimId: string,
+  ) => boolean;
+  rollbackPending: (
+    interviewId: string,
+    kind: PendingKind,
+    claimId: string,
+  ) => boolean;
   consumePendingAnswers: (
     interviewId: string,
   ) => Array<{ questionId: string; answer: string }> | null;
@@ -197,16 +224,90 @@ export function createDashboardServer(config: DashboardConfig): {
 } {
   const authToken = crypto.randomBytes(32).toString('hex');
   let activeServer: Server | null = null;
+  let pendingServer: Server | null = null;
   let baseUrl: string | null = null;
+  let startPromise: Promise<string> | null = null;
+  let closed = false;
 
   // Session registry
   const sessions = new Map<string, RegisteredSession>();
 
   // Interview state cache
   const stateCache = new Map<string, InterviewStateEntry>();
+  const pendingClaims = new Map<string, PendingClaim>();
+  let claimCounter = 0;
+
+  function claimKey(interviewId: string, kind: PendingKind): string {
+    return `${interviewId}:${kind}`;
+  }
+
+  function getOrCreateClaim(
+    interviewId: string,
+    kind: PendingKind,
+  ): PendingClaim {
+    const key = claimKey(interviewId, kind);
+    const existing = pendingClaims.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const claim = { claimId: `delivery-${++claimCounter}`, kind };
+    pendingClaims.set(key, claim);
+    return claim;
+  }
+
+  function acknowledgePending(
+    interviewId: string,
+    kind: PendingKind,
+    claimId: string,
+  ): boolean {
+    const key = claimKey(interviewId, kind);
+    const claim = pendingClaims.get(key);
+    if (!claim || claim.claimId !== claimId) return false;
+    const entry = stateCache.get(interviewId);
+    if (!entry) return false;
+    pendingClaims.delete(key);
+    if (kind === 'answers') entry.pendingAnswers = null;
+    if (kind === 'nudge') entry.nudgeAction = null;
+    if (kind === 'block-comment') entry.pendingBlockComment = null;
+    if (kind === 'chat') entry.pendingChatMessage = null;
+    entry.lastUpdatedAt = Date.now();
+    return true;
+  }
+
+  function rollbackPending(
+    interviewId: string,
+    kind: PendingKind,
+    claimId: string,
+  ): boolean {
+    const key = claimKey(interviewId, kind);
+    const claim = pendingClaims.get(key);
+    if (!claim || claim.claimId !== claimId) return false;
+    pendingClaims.delete(key);
+    return true;
+  }
 
   // SSE client registry: interviewId → Set<ServerResponse>
   const sseClients = new Map<string, Set<import('node:http').ServerResponse>>();
+  const sseHeartbeats = new Map<
+    import('node:http').ServerResponse,
+    ReturnType<typeof setInterval>
+  >();
+
+  function removeSseClient(
+    interviewId: string,
+    response: ServerResponse,
+  ): void {
+    const heartbeat = sseHeartbeats.get(response);
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      sseHeartbeats.delete(response);
+    }
+
+    const clients = sseClients.get(interviewId);
+    clients?.delete(response);
+    if (clients && clients.size === 0) sseClients.delete(interviewId);
+  }
 
   function formatSseState(entry: InterviewStateEntry) {
     const markdownPath = entry.filePath;
@@ -249,7 +350,7 @@ export function createDashboardServer(config: DashboardConfig): {
       try {
         res.write(payload);
       } catch {
-        clients.delete(res);
+        removeSseClient(interviewId, res);
       }
     }
     if (clients.size === 0) sseClients.delete(interviewId);
@@ -317,7 +418,7 @@ export function createDashboardServer(config: DashboardConfig): {
 
   function getKnownDirectories(): Set<string> {
     const dirs = new Set<string>();
-    // Always scan home directory — interviews may have been created from a
+    // Always scan home directory - interviews may have been created from a
     // session that ran with cwd=$HOME and never registered with the dashboard.
     dirs.add(os.homedir());
     for (const session of sessions.values()) {
@@ -335,7 +436,7 @@ export function createDashboardServer(config: DashboardConfig): {
   async function discoverSessionDirectories(): Promise<void> {
     if (!config.sessionClient) return;
     try {
-      const result = await config.sessionClient.list({ limit: 500 });
+      const result = await config.sessionClient.list({ query: {} });
       const sessionList = result.data;
       if (!sessionList) return;
 
@@ -352,7 +453,7 @@ export function createDashboardServer(config: DashboardConfig): {
         discoveredFolders.add(session.directory);
       }
     } catch {
-      // Session list not available — rely on registered sessions
+      // Session list not available - rely on registered sessions
     }
   }
 
@@ -504,7 +605,7 @@ export function createDashboardServer(config: DashboardConfig): {
     );
     const pathname = decodeURIComponent(url.pathname);
 
-    // NOTE: No CORS headers. Same-origin only — dashboard pages and
+    // NOTE: No CORS headers. Same-origin only - dashboard pages and
     // API share the same origin (127.0.0.1:port). Cross-origin POST is
     // blocked by browser preflight since we don't send Access-Control
     // headers. Do NOT add them without also adding CSRF protection.
@@ -696,6 +797,29 @@ export function createDashboardServer(config: DashboardConfig): {
       return;
     }
 
+    // ── API: unregister session ────────────────────────────────────
+    if (request.method === 'POST' && pathname === '/api/unregister') {
+      let body: unknown;
+      try {
+        body = await readJsonBody(request);
+      } catch {
+        sendJson(response, 400, { error: 'Invalid JSON' });
+        return;
+      }
+      const { sessionID } = body as { sessionID?: string };
+      if (!sessionID || !isValidId(sessionID)) {
+        sendJson(response, 400, { error: 'sessionID required' });
+        return;
+      }
+      sessions.delete(sessionID);
+      for (const [id, entry] of stateCache) {
+        if (entry.sessionID === sessionID) stateCache.delete(id);
+      }
+      fileCache = null;
+      sendJson(response, 200, { status: 'unregistered' });
+      return;
+    }
+
     // ── API: create interview ──────────────────────────────────────
     if (request.method === 'POST' && pathname === '/api/interviews') {
       let body: unknown;
@@ -791,12 +915,11 @@ export function createDashboardServer(config: DashboardConfig): {
           // will be cleaned up on close
         }
       }, 15000);
+      sseHeartbeats.set(response, heartbeat);
 
       // Cleanup on disconnect
       request.on('close', () => {
-        clearInterval(heartbeat);
-        clients?.delete(response);
-        if (clients && clients.size === 0) sseClients.delete(interviewId);
+        removeSseClient(interviewId, response);
       });
       return;
     }
@@ -945,6 +1068,47 @@ export function createDashboardServer(config: DashboardConfig): {
       return;
     }
 
+    // ── API: acknowledge or roll back a claimed delivery ────────────
+    const deliveryMatch = pathname.match(
+      /^\/api\/interviews\/([^/]+)\/(pending|nudge|block-comment|chat)\/(ack|rollback)$/,
+    );
+    if (request.method === 'POST' && deliveryMatch) {
+      const interviewId = deliveryMatch[1];
+      const kind =
+        deliveryMatch[2] === 'pending'
+          ? 'answers'
+          : (deliveryMatch[2] as PendingKind);
+      const operation = deliveryMatch[3];
+      if (!isValidId(interviewId)) {
+        sendJson(response, 400, { error: 'Invalid interview ID' });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(request);
+      } catch {
+        sendJson(response, 400, { error: 'Invalid JSON' });
+        return;
+      }
+      const claimId = (body as { claimId?: unknown }).claimId;
+      if (typeof claimId !== 'string' || !claimId) {
+        sendJson(response, 400, { error: 'claimId required' });
+        return;
+      }
+      const accepted =
+        operation === 'ack'
+          ? acknowledgePending(interviewId, kind, claimId)
+          : rollbackPending(interviewId, kind, claimId);
+      if (!accepted) {
+        sendJson(response, 409, { error: 'Unknown or stale delivery claim' });
+        return;
+      }
+      sendJson(response, 200, {
+        status: operation === 'ack' ? 'acked' : 'rolled-back',
+      });
+      return;
+    }
+
     // ── API: submit answers (browser → dashboard) ──────────────────
     if (
       request.method === 'POST' &&
@@ -977,6 +1141,7 @@ export function createDashboardServer(config: DashboardConfig): {
       };
       if (
         !Array.isArray(answers) ||
+        answers.length === 0 ||
         !answers.every(
           (a) =>
             typeof a === 'object' &&
@@ -992,10 +1157,17 @@ export function createDashboardServer(config: DashboardConfig): {
         return;
       }
 
+      if (
+        entry.pendingAnswers ||
+        pendingClaims.has(claimKey(interviewId, 'answers'))
+      ) {
+        sendJson(response, 409, { error: 'Answers are already queued.' });
+        return;
+      }
       entry.pendingAnswers = answers;
       entry.mode = 'awaiting-agent';
       entry.lastUpdatedAt = Date.now();
-      sendJson(response, 200, { status: 'ok' });
+      sendJson(response, 202, { status: 'queued' });
       return;
     }
 
@@ -1041,10 +1213,17 @@ export function createDashboardServer(config: DashboardConfig): {
         return;
       }
 
+      if (
+        entry.pendingBlockComment ||
+        pendingClaims.has(claimKey(interviewId, 'block-comment'))
+      ) {
+        sendJson(response, 409, { error: 'Block feedback is already queued.' });
+        return;
+      }
       entry.pendingBlockComment = { section, comment };
       entry.mode = 'awaiting-agent';
       entry.lastUpdatedAt = Date.now();
-      sendJson(response, 200, { status: 'ok' });
+      sendJson(response, 202, { status: 'queued' });
       return;
     }
 
@@ -1070,11 +1249,14 @@ export function createDashboardServer(config: DashboardConfig): {
         sendJson(response, 404, { error: 'Interview not found' });
         return;
       }
-      const val = entry.pendingBlockComment;
-      if (val) {
-        entry.pendingBlockComment = null;
-      }
-      sendJson(response, 200, val || {});
+      const val = entry.pendingBlockComment
+        ? {
+            claimId: getOrCreateClaim(interviewId, 'block-comment').claimId,
+            section: entry.pendingBlockComment.section,
+            comment: entry.pendingBlockComment.comment,
+          }
+        : null;
+      sendJson(response, 200, val ?? {});
       return;
     }
 
@@ -1117,10 +1299,17 @@ export function createDashboardServer(config: DashboardConfig): {
         return;
       }
 
+      if (
+        entry.pendingChatMessage ||
+        pendingClaims.has(claimKey(interviewId, 'chat'))
+      ) {
+        sendJson(response, 409, { error: 'Chat message is already queued.' });
+        return;
+      }
       entry.pendingChatMessage = message.trim();
       entry.mode = 'awaiting-agent';
       entry.lastUpdatedAt = Date.now();
-      sendJson(response, 200, { status: 'ok' });
+      sendJson(response, 202, { status: 'queued' });
       return;
     }
 
@@ -1146,11 +1335,13 @@ export function createDashboardServer(config: DashboardConfig): {
         sendJson(response, 404, { error: 'Interview not found' });
         return;
       }
-      const val = entry.pendingChatMessage;
-      if (val) {
-        entry.pendingChatMessage = null;
-      }
-      sendJson(response, 200, { message: val || null });
+      const val = entry.pendingChatMessage
+        ? {
+            claimId: getOrCreateClaim(interviewId, 'chat').claimId,
+            message: entry.pendingChatMessage,
+          }
+        : null;
+      sendJson(response, 200, val ?? { message: null });
       return;
     }
 
@@ -1176,13 +1367,15 @@ export function createDashboardServer(config: DashboardConfig): {
         sendJson(response, 404, { error: 'Interview not found' });
         return;
       }
-      // Atomically consume pending answers (like nudge pattern)
-      const answers = entry.pendingAnswers;
-      if (answers) {
-        entry.pendingAnswers = null;
-      }
+      const claimed = entry.pendingAnswers
+        ? {
+            claimId: getOrCreateClaim(interviewId, 'answers').claimId,
+            answers: entry.pendingAnswers,
+          }
+        : null;
       sendJson(response, 200, {
-        answers,
+        claimId: claimed?.claimId ?? null,
+        answers: claimed?.answers ?? null,
       });
       return;
     }
@@ -1229,10 +1422,17 @@ export function createDashboardServer(config: DashboardConfig): {
         return;
       }
 
+      if (
+        entry.nudgeAction ||
+        pendingClaims.has(claimKey(interviewId, 'nudge'))
+      ) {
+        sendJson(response, 409, { error: 'Nudge action is already queued.' });
+        return;
+      }
       entry.nudgeAction = action;
       entry.mode = 'awaiting-agent';
       entry.lastUpdatedAt = Date.now();
-      sendJson(response, 200, { status: 'ok' });
+      sendJson(response, 202, { status: 'queued' });
       return;
     }
 
@@ -1258,11 +1458,16 @@ export function createDashboardServer(config: DashboardConfig): {
         sendJson(response, 404, { error: 'Interview not found' });
         return;
       }
-      const action = entry.nudgeAction;
-      if (action) {
-        entry.nudgeAction = null; // Clear after reading
-      }
-      sendJson(response, 200, { action });
+      const claimed = entry.nudgeAction
+        ? {
+            claimId: getOrCreateClaim(interviewId, 'nudge').claimId,
+            action: entry.nudgeAction,
+          }
+        : null;
+      sendJson(response, 200, {
+        claimId: claimed?.claimId ?? null,
+        action: claimed?.action ?? null,
+      });
       return;
     }
 
@@ -1290,14 +1495,25 @@ export function createDashboardServer(config: DashboardConfig): {
 
   // ─── Server Lifecycle ────────────────────────────────────────────
 
+  function closeServer(server: Server): void {
+    server.closeAllConnections();
+    try {
+      server.close();
+    } catch {
+      // The server may still be in the listen transition.
+    }
+  }
+
   function start(): Promise<string> {
     if (baseUrl) return Promise.resolve(baseUrl);
+    if (closed) return Promise.reject(new Error('Dashboard server is closed.'));
+    if (startPromise) return startPromise;
 
     if (!cleanupTimer) {
       cleanupTimer = createCleanupTimer();
     }
 
-    return new Promise((resolve, reject) => {
+    startPromise = new Promise((resolve, reject) => {
       const server = createServer((request, response) => {
         handleRequest(request, response).catch((error: unknown) => {
           sendJson(response, 500, {
@@ -1311,7 +1527,8 @@ export function createDashboardServer(config: DashboardConfig): {
       server.headersTimeout = 10_000;
 
       server.on('error', (error: NodeJS.ErrnoException) => {
-        server.close();
+        closeServer(server);
+        pendingServer = null;
         if (error.code === 'EADDRINUSE') {
           reject(new Error(`Dashboard port ${config.port} is already in use.`));
         } else {
@@ -1319,21 +1536,39 @@ export function createDashboardServer(config: DashboardConfig): {
         }
       });
 
+      pendingServer = server;
       server.listen(config.port, '127.0.0.1', () => {
         const address = server.address();
         if (!address || typeof address === 'string') {
+          pendingServer = null;
           reject(new Error('Failed to start dashboard server'));
           return;
         }
         activeServer = server;
+        pendingServer = null;
         baseUrl = `http://127.0.0.1:${address.port}`;
+        if (closed) {
+          activeServer = null;
+          baseUrl = null;
+          closeServer(server);
+          reject(new Error('Dashboard server is closed.'));
+          return;
+        }
         writeAuthFile(config.port, authToken);
         resolve(baseUrl);
       });
     });
+
+    startPromise.catch(() => {
+      startPromise = null;
+    });
+    return startPromise;
   }
 
   function close(): void {
+    if (closed) return;
+    closed = true;
+
     if (cleanupTimer) {
       clearInterval(cleanupTimer);
       cleanupTimer = null;
@@ -1341,6 +1576,11 @@ export function createDashboardServer(config: DashboardConfig): {
 
     for (const clients of sseClients.values()) {
       for (const response of clients) {
+        const heartbeat = sseHeartbeats.get(response);
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          sseHeartbeats.delete(response);
+        }
         try {
           if (!response.writableEnded && !response.destroyed) {
             response.end();
@@ -1356,14 +1596,16 @@ export function createDashboardServer(config: DashboardConfig): {
     }
 
     sseClients.clear();
+    pendingClaims.clear();
 
     removeAuthFile(config.port);
 
-    if (activeServer) {
-      activeServer.closeAllConnections();
-      activeServer.close();
-      activeServer = null;
-      baseUrl = null;
+    const server = activeServer ?? pendingServer;
+    activeServer = null;
+    pendingServer = null;
+    baseUrl = null;
+    if (server) {
+      closeServer(server);
     }
   }
 
@@ -1387,6 +1629,14 @@ export function createDashboardServer(config: DashboardConfig): {
       for (const [id, entry] of stateCache) {
         if (entry.sessionID === sessionID) {
           stateCache.delete(id);
+          for (const kind of [
+            'answers',
+            'nudge',
+            'block-comment',
+            'chat',
+          ] as PendingKind[]) {
+            pendingClaims.delete(claimKey(id, kind));
+          }
         }
       }
       fileCache = null;
@@ -1423,6 +1673,32 @@ export function createDashboardServer(config: DashboardConfig): {
       }
     },
     getPendingAnswers: (id) => stateCache.get(id)?.pendingAnswers ?? null,
+    claimPendingAnswers: (id) => {
+      const entry = stateCache.get(id);
+      if (!entry?.pendingAnswers) return null;
+      const claim = getOrCreateClaim(id, 'answers');
+      return { claimId: claim.claimId, answers: entry.pendingAnswers };
+    },
+    claimNudgeAction: (id) => {
+      const entry = stateCache.get(id);
+      if (!entry?.nudgeAction) return null;
+      const claim = getOrCreateClaim(id, 'nudge');
+      return { claimId: claim.claimId, action: entry.nudgeAction };
+    },
+    claimBlockComment: (id) => {
+      const entry = stateCache.get(id);
+      if (!entry?.pendingBlockComment) return null;
+      const claim = getOrCreateClaim(id, 'block-comment');
+      return { claimId: claim.claimId, comment: entry.pendingBlockComment };
+    },
+    claimChatMessage: (id) => {
+      const entry = stateCache.get(id);
+      if (!entry?.pendingChatMessage) return null;
+      const claim = getOrCreateClaim(id, 'chat');
+      return { claimId: claim.claimId, message: entry.pendingChatMessage };
+    },
+    acknowledgePending,
+    rollbackPending,
     consumePendingAnswers: (id) => {
       const entry = stateCache.get(id);
       if (!entry?.pendingAnswers) return null;
@@ -1517,13 +1793,15 @@ export async function tryBecomeDashboard(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes('already in use')) {
+        dashboard.close();
         // Another process won the race, wait with jitter and retry
         if (attempt < maxAttempts - 1) {
           await new Promise((resolve) => setTimeout(resolve, jitterMs()));
           continue;
         }
-        return null; // All retries exhausted — treat as session
+        return null; // All retries exhausted - treat as session
       }
+      dashboard.close();
       throw error;
     }
   }

@@ -57,7 +57,19 @@ describe('deepwork command hook', () => {
 
     expect(output.parts).toHaveLength(1);
     expect(output.parts[0].text).toContain('Use the deepwork skill');
+    expect(output.parts[0].text).toContain(
+      'before planning, delegation, or creating state',
+    );
+    expect(output.parts[0].text).toContain('.gitignore');
+    expect(output.parts[0].text).toContain('.ignore');
+    expect(output.parts[0].text).toContain('!.slim/deepwork/');
+    expect(output.parts[0].text).toContain('!.slim/deepwork/**');
+    expect(output.parts[0].text).toContain(
+      'add only missing entries without duplicates',
+    );
+    expect(output.parts[0].text).toContain('git-local yet OpenCode-readable');
     expect(output.parts[0].text).toContain('.slim/deepwork/');
+    expect(output.parts[0].text).toContain('save code/doc deliverables');
     expect(output.parts[0].text).toContain('@oracle');
     expect(output.parts[0].text).toContain('simplify/readability');
     expect(output.parts[0].text).toContain('refactor scheduler state');

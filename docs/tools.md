@@ -10,11 +10,17 @@ Slim only intercepts `apply_patch` before the native tool runs. It rewrites reco
 
 ## Web Fetch
 
-Fetch remote pages with content extraction tuned for docs/static sites.
+Enhanced version of OpenCode's built-in `webfetch`. Overrides the default when
+this plugin is active. Fetch remote pages with content extraction tuned for
+docs/static sites.
 
 | Tool | Description |
 |------|-------------|
-| `webfetch` | Fetch a URL, optionally prefer `llms.txt`, extract main content from HTML, include metadata, and optionally save binary responses |
+| `webfetch` | Fetch a URL, optionally prefer `llms.txt`, extract main content from HTML, include metadata, optionally save binary responses, and optionally run secondary-model extraction |
+
+See the full [Webfetch documentation](webfetch.md) for parameters, output
+format, caching, llms.txt probing, redirect policy, secondary-model
+summarization, binary detection, and implementation details.
 
 `webfetch` blocks cross-origin redirects unless the requested URL or derived permission patterns explicitly allow them, and it can fall back to the raw fetched content when secondary-model summarization is unavailable.
 
@@ -22,7 +28,7 @@ Fetch remote pages with content extraction tuned for docs/static sites.
 
 ## Code Search Tools
 
-Fast, structural code search and refactoring — more powerful than plain text grep.
+Fast, structural code search and refactoring - more powerful than plain text grep.
 
 | Tool | Description |
 |------|-------------|
@@ -38,15 +44,35 @@ Fast, structural code search and refactoring — more powerful than plain text g
 
 | Tool | Description |
 |------|-------------|
-| `cancel_task` | Cancel a tracked background specialist task by native task ID or Background Job Board alias |
+| `task` | Start a specialist task and return its task ID |
+| `task_status` | Check the status of a task |
+| `task_result` | Retrieve a task's result |
+| `task_message` | Queue a non-interrupting message and return `queued` |
+| `task_cancel` | Stop a generation while retaining its session |
+| `task_revive` | Resume a retained session with a new instruction |
+| `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message |
 
-`cancel_task` is orchestrator-only. It only cancels background tasks tracked for
-the current orchestrator session, and it does not roll back partial edits. After
-cancelling a write-capable task, inspect and reconcile file changes before
+The task controls use the task ID or Background Job Board alias for the task being
+managed. `task_message` does not interrupt the current generation. `task_cancel`
+stops the generation but retains its session; it does not roll back partial edits.
+After cancelling a write-capable task, inspect and reconcile file changes before
 launching replacement work.
 
-See [Background Job Board Lessons](background-job-board-lessons.md) for the
-session lifecycle and cancellation edge cases behind this tool.
+`task_revive` resumes a retained session with a new instruction. A cancelled or
+errored retained session may be revived immediately once its retained state has
+been verified safe. Acknowledgement controls parent and job-board consumption and
+reusable-pool display, not same-session revival.
+
+`wait_for_user` is also orchestrator-only. The orchestrator uses it as the final
+tool action after providing concrete instructions for external manual work. Its
+`reason` is diagnostic text only; the plugin does not parse assistant prose to
+decide whether a turn is HITL. A new real user text/file/image message clears the
+wait. Synthetic/internal messages and duplicate delivery of the user message
+that preceded the wait do not.
+
+See the background orchestration concepts in
+[Background Orchestration](background-orchestration.md) for the session
+lifecycle, cancellation, and explicit-wait edge cases behind these tools.
 
 ---
 

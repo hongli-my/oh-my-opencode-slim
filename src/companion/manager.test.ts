@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
@@ -11,6 +18,8 @@ import {
 // Point writes at a temp dir so tests don't touch the real state file.
 const TEST_DIR = path.join(os.tmpdir(), `companion-test-${process.pid}`);
 const XDG_DIR = path.join(TEST_DIR, 'xdg');
+const managers: CompanionManager[] = [];
+
 function readState() {
   return JSON.parse(readFileSync(stateFilePath(), 'utf8'));
 }
@@ -21,6 +30,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const manager of managers.splice(0)) {
+    manager.onExit();
+  }
   rmSync(TEST_DIR, { recursive: true, force: true });
   delete process.env.XDG_DATA_HOME;
 });
@@ -30,7 +42,39 @@ function make(
   cwd = '/home/user/myproject',
   config: any = { enabled: true, position: 'bottom-right', size: 'medium' },
 ) {
-  return new CompanionManager(id, cwd, config);
+  const manager = new CompanionManager(id, cwd, config);
+  managers.push(manager);
+  return manager;
+}
+
+function attachFakeChild(manager: CompanionManager): { killed: () => boolean } {
+  let killed = false;
+  (
+    manager as unknown as {
+      companionProcess: { kill: () => void } | null;
+    }
+  ).companionProcess = {
+    kill: () => {
+      killed = true;
+    },
+  };
+  return { killed: () => killed };
+}
+
+function attachFailingChild(manager: CompanionManager): void {
+  (
+    manager as unknown as {
+      companionProcess: { kill: () => void } | null;
+    }
+  ).companionProcess = {
+    kill: () => {
+      throw new Error('mock kill failure');
+    },
+  };
+}
+
+function companionPidFile(): string {
+  return path.join(path.dirname(stateFilePath()), 'companion.pid');
 }
 
 describe('CompanionManager', () => {
@@ -170,12 +214,36 @@ describe('CompanionManager', () => {
     expect(readState().sessions[0].active_agents).toEqual(['intro']);
   });
 
-  it('ignores status events without agent or with unknown status', () => {
+  it('ignores status events with unknown status but tracks busy without agent', () => {
     const m = make();
     m.onLoad();
     m.onSessionStatus({ sessionId: 'ses_x', agent: undefined, status: 'busy' });
     m.onSessionStatus({ sessionId: 'ses_y', agent: 'fixer', status: 'retry' });
+    // ses_x is now tracked because Herdr subagents often lack
+    // the agent field; the session ID is used as a fallback name.
+    expect(readState().sessions[0].active_agents).toEqual(['ses_x']);
+  });
+
+  it('accepts busy sessions from agents without a known name (Herdr subagents)', () => {
+    const m = make();
+    m.onLoad();
+    // Simulate a Herdr subagent: busy event fires but agent is undefined
+    m.onSessionStatus({
+      sessionId: 'herdr_ses',
+      agent: undefined,
+      status: 'busy',
+    });
+    expect(readState().sessions[0].active_agents).toEqual(['herdr_ses']);
+    // The overall status stays 'idle' — only the orchestrator drives
+    // that field. Herdr subagents appear in active_agents.
+    // When the session goes idle it is removed even without a known agent name
+    m.onSessionStatus({
+      sessionId: 'herdr_ses',
+      agent: undefined,
+      status: 'idle',
+    });
     expect(readState().sessions[0].active_agents).toEqual(['intro']);
+    expect(readState().sessions[0].status).toBe('idle');
   });
 
   it('shows input gif while waiting for user input', () => {
@@ -208,6 +276,59 @@ describe('CompanionManager', () => {
     m.onSessionStatus({ sessionId: 'ses_a', agent: 'fixer', status: 'busy' });
     m.onSessionStatus({ sessionId: 'ses_b', agent: 'fixer', status: 'busy' });
     expect(readState().sessions[0].active_agents).toEqual(['fixer', 'fixer']);
+  });
+
+  it('keeps at most one process exit listener across reloads', () => {
+    const baseline = process.listenerCount('exit');
+    for (let i = 0; i < 5; i++) {
+      const m = make('reload-session');
+      m.onLoad();
+    }
+    // Re-inits must dedup the exit listener rather than stacking one each time.
+    expect(process.listenerCount('exit')).toBeLessThanOrEqual(baseline + 1);
+    // onExit releases the live listener again.
+    managers.at(-1)?.onExit();
+    expect(process.listenerCount('exit')).toBeLessThanOrEqual(baseline);
+  });
+
+  it('cleans up a superseded manager for the same session on reload', () => {
+    const first = make('reload-session');
+    first.onLoad();
+    const firstChild = attachFakeChild(first);
+    writeFileSync(companionPidFile(), String(process.pid));
+    (first as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (first as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid =
+      process.pid;
+
+    const second = make('reload-session');
+    second.onLoad();
+
+    expect(firstChild.killed()).toBe(true);
+    expect(readState().sessions).toHaveLength(1);
+    expect(readState().sessions[0].session_id).toBe('reload-session');
+
+    second.onExit();
+  });
+
+  it('cleans up active managers when companion is disabled on reload', () => {
+    const enabled = make('disable-session');
+    enabled.onLoad();
+    const child = attachFakeChild(enabled);
+    writeFileSync(companionPidFile(), String(process.pid));
+    (enabled as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (
+      enabled as unknown as { spawnedCompanionPid: number }
+    ).spawnedCompanionPid = process.pid;
+
+    const disabled = new CompanionManager('disable-session', '/path', {
+      enabled: false,
+      position: 'bottom-right',
+      size: 'medium',
+    });
+    disabled.onLoad();
+
+    expect(child.killed()).toBe(true);
+    expect(readState().sessions).toEqual([]);
   });
 
   it('removes its entry on exit', () => {
@@ -365,6 +486,143 @@ describe('CompanionManager', () => {
     expect(state.config.enabled).toBe(true);
   });
 
+  it('skips spawn when PID file points to a live process', () => {
+    // Write a PID file with our own PID (which is alive)
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, String(process.pid));
+
+    const m = make('test-pid-guard');
+    m.onLoad();
+
+    // Should not have spawned — PID file guard prevented it
+    // The session should still be written to state
+    const state = readState();
+    expect(state.sessions[0].session_id).toBe('test-pid-guard');
+  });
+
+  it('spawns when PID file contains a dead process', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    // Use an impossibly high PID that no kernel will ever assign
+    writeFileSync(pidFile, '999999999');
+
+    const m = make('test-stale-pid');
+    m.onLoad();
+
+    // Stale PID file should have been cleaned up
+    expect(existsSync(pidFile)).toBe(false);
+    const state = readState();
+    expect(state.sessions[0].session_id).toBe('test-stale-pid');
+  });
+
+  it('skips spawn while another process holds the PID file lock', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    const lock = `${pidFile}.lock`;
+    mkdirSync(lock);
+    writeFileSync(path.join(lock, 'owner'), String(process.pid));
+
+    const m = make('test-pending-pid');
+    m.onLoad();
+    m.onExit();
+
+    expect(existsSync(lock)).toBe(true);
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it('stores the spawned child PID in the PID file', () => {
+    const bin = path.join(TEST_DIR, 'fake-companion');
+    writeFileSync(bin, '#!/bin/sh\nexec sleep 30\n');
+    chmodSync(bin, 0o755);
+
+    const m = make('test-child-pid', '/path', {
+      enabled: true,
+      position: 'bottom-right',
+      size: 'medium',
+      binaryPath: bin,
+    });
+    m.onLoad();
+
+    const pid = Number(readFileSync(companionPidFile(), 'utf8'));
+    expect(Number.isInteger(pid)).toBe(true);
+    expect(pid).not.toBe(process.pid);
+    expect(pid).toBe(
+      (m as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid,
+    );
+  });
+
+  it('spawns when no PID file exists', () => {
+    const m = make('test-no-pid');
+    m.onLoad();
+    const state = readState();
+    expect(state.sessions[0].session_id).toBe('test-no-pid');
+  });
+
+  it('cleans up PID file on exit when this manager was the spawner', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, '999999999'); // stale PID so spawn proceeds
+
+    const m = make('test-pid-cleanup');
+    // Simulate a spawner by writing a PID file as if spawn succeeded.
+    // In reality the binary doesn't exist so spawn fails before writing,
+    // but the cleanup logic only fires when wasSpawner is true.
+    writeFileSync(pidFile, String(process.pid));
+    (m as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (m as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid =
+      process.pid;
+    m.onLoad();
+    m.onExit();
+
+    expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it('does not delete PID file on exit when this manager was not the spawner', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, String(process.pid));
+
+    const m = make('test-pid-no-cleanup');
+    m.onLoad(); // skips spawn because PID is alive, wasSpawner stays false
+    m.onExit();
+
+    // Non-spawner must not delete the guard file
+    expect(existsSync(pidFile)).toBe(true);
+  });
+
+  it('does not delete a PID file owned by a different spawned child', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, '222222222');
+
+    const m = make('test-pid-different-child');
+    (m as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (m as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid =
+      111111111;
+    m.onExit();
+
+    expect(readFileSync(pidFile, 'utf8')).toBe('222222222');
+  });
+
+  it('does not kill the singleton when another session remains in state', () => {
+    const first = make('first-session');
+    const second = make('second-session');
+    first.onLoad();
+    second.onLoad();
+    const child = attachFakeChild(first);
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, String(process.pid));
+    (first as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (first as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid =
+      process.pid;
+
+    first.onExit();
+
+    expect(child.killed()).toBe(false);
+    expect(readFileSync(pidFile, 'utf8')).toBe(String(process.pid));
+  });
+
   it('removes disabled session entries on load', () => {
     mkdirSync(path.dirname(stateFilePath()), { recursive: true });
     writeFileSync(
@@ -397,5 +655,70 @@ describe('CompanionManager', () => {
       position: 'bottom-right',
       size: 'medium',
     });
+  });
+
+  it('recovers from corrupt state file gracefully', () => {
+    const statePath = stateFilePath();
+    mkdirSync(path.dirname(statePath), { recursive: true });
+    writeFileSync(statePath, 'not-valid-json');
+
+    const m = make();
+    m.onLoad();
+
+    // Must gracefully degrade to default state
+    const state = readState();
+    expect(state.version).toBe(1);
+    expect(state.sessions).toHaveLength(1);
+  });
+
+  it('handles state write failure during disabled onLoad gracefully', () => {
+    const statePath = stateFilePath();
+    mkdirSync(path.dirname(statePath), { recursive: true });
+    writeFileSync(statePath, JSON.stringify({ version: 1, sessions: [] }));
+    const originalContent = readFileSync(statePath, 'utf8');
+    chmodSync(statePath, 0o444);
+
+    const m = new CompanionManager('test-disabled', '/path', {
+      enabled: false,
+      position: 'bottom-right',
+      size: 'medium',
+    });
+    m.onLoad();
+
+    // State file must be preserved despite write failure (catch swallowed the error)
+    chmodSync(statePath, 0o644);
+    expect(readFileSync(statePath, 'utf8')).toBe(originalContent);
+  });
+
+  it('handles empty state file gracefully', () => {
+    // readState catches JSON parse errors and returns a clean default state
+    const statePath = stateFilePath();
+    mkdirSync(path.dirname(statePath), { recursive: true });
+    writeFileSync(statePath, '');
+
+    const m = make();
+    expect(() => {
+      m.onLoad();
+    }).not.toThrow();
+
+    const state = readState();
+    expect(state.version).toBe(1);
+    expect(state.sessions).toHaveLength(1);
+  });
+
+  it('logs and swallows kill() failure gracefully during exit', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    const pidFile = companionPidFile();
+    writeFileSync(pidFile, String(process.pid));
+
+    const m = make('test-kill-failure');
+    attachFailingChild(m);
+    (m as unknown as { wasSpawner: boolean }).wasSpawner = true;
+    (m as unknown as { spawnedCompanionPid: number }).spawnedCompanionPid =
+      process.pid;
+
+    // Must not propagate the kill() exception
+    expect(() => m.onExit()).not.toThrow();
+    expect(existsSync(pidFile)).toBe(false);
   });
 });

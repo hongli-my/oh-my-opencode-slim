@@ -16,20 +16,34 @@ import type {
 } from './types';
 import { trimBlankRuns } from './utils';
 
-export function normalizeUrl(input: string) {
+export function normalizeUrl(input: string): {
+  url: string;
+  upgradedToHttps: boolean;
+  fallbackUrl: string | undefined;
+  originalUrl: string;
+} {
   const parsed = new URL(input);
   const originalUrl = parsed.toString();
   let upgradedToHttps = false;
   let fallbackUrl: string | undefined;
   if (parsed.protocol === 'http:') {
-    fallbackUrl = originalUrl;
+    fallbackUrl = parsed.toString();
     parsed.protocol = 'https:';
     upgradedToHttps = true;
+  }
+  // Fragments never reach the server (RFC 3986 §3.5); strip them from the
+  // URLs actually fetched so the same document requested with different
+  // anchors issues a single request. originalUrl keeps the fragment.
+  parsed.hash = '';
+  if (fallbackUrl) {
+    const fallback = new URL(fallbackUrl);
+    fallback.hash = '';
+    fallbackUrl = fallback.toString();
   }
   return { url: parsed.toString(), upgradedToHttps, fallbackUrl, originalUrl };
 }
 
-export function isDocsLikeUrl(url: URL) {
+export function isDocsLikeUrl(url: URL): boolean {
   const host = url.hostname.toLowerCase();
   return (
     DOCS_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix)) ||
@@ -40,7 +54,7 @@ export function isDocsLikeUrl(url: URL) {
 export function buildPermissionPatterns(
   normalized: ReturnType<typeof normalizeUrl>,
   shouldProbeLlmsTxt: boolean,
-) {
+): string[] {
   const patterns = new Set<string>([normalized.url]);
   const origins = [new URL(normalized.url).origin];
   if (normalized.fallbackUrl) {

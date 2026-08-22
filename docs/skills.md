@@ -1,8 +1,22 @@
 # Skills
 
-Skills are specialized capabilities you can assign to agents. Unlike MCPs (which are running servers), skills are **prompt-based tool configurations** — instructions injected into an agent's system prompt that describe how to use a particular tool.
+Skills are specialized capabilities and workflows you can assign to agents.
+Unlike MCPs (which are running servers), skills are **prompt-based instructions**
+injected into an agent's system prompt to guide decisions, workflows, and, when
+relevant, tool use.
 
-Bundled skills are installed by the `oh-my-opencode-slim` installer.
+Bundled skills are installed by the `oh-my-opencode-slim` installer and safely
+reconciled on plugin startup/auto-update. Local customizations are preserved;
+new bundled versions for customized skills are staged under
+`~/.config/opencode/.oh-my-opencode-slim/skill-updates/` for manual review.
+
+---
+
+## Verification and Review Budget
+
+Use a proportionate final-state verification plan for each change. Run checks
+required by repository and release instructions; add independent review or
+broader evidence only when the change's risk or uncertainty warrants it.
 
 ---
 
@@ -16,9 +30,9 @@ Bundled skills are installed by the `oh-my-opencode-slim` installer.
 | [`codemap`](#codemap) | Repository codemap generation | `orchestrator` |
 | [`clonedeps`](#clonedeps) | Local dependency source cloning | `orchestrator` |
 | [`deepwork`](#deepwork) | Heavy/complex coding sessions workflow | `orchestrator` |
+| [`verification-planning`](#verification-planning) | Design project-specific evidence before implementation | `orchestrator` |
 | [`reflect`](#reflect) | Review repeated work and suggest reusable workflow improvements | `orchestrator` |
 | [`worktrees`](#worktrees) | Safe Git worktree lane management | `orchestrator` |
-| [`release-smoke-test`](#release-smoke-test) | Packed release-candidate and bugfix smoke validation | `orchestrator` |
 | [`oh-my-opencode-slim`](#oh-my-opencode-slim) | Plugin configuration and self-improvement guidance | `orchestrator` |
 
 ---
@@ -44,10 +58,10 @@ Source: adapted from Addy Osmani's `code-simplification` skill and bundled local
 **How to use:** Ask the Orchestrator to `run codemap`. It automatically detects whether to initialize a new map or update an existing one.
 
 **Why it's useful:**
-- **Instant onboarding** — understand unfamiliar codebases in seconds
-- **Efficient context** — agents read architectural summaries, saving tokens and improving accuracy
-- **Change detection** — only modified folders are re-analyzed
-- **Timeless documentation** — focuses on high-level design, not implementation details
+- **Instant onboarding** - understand unfamiliar codebases in seconds
+- **Efficient context** - agents read architectural summaries, saving tokens and improving accuracy
+- **Change detection** - only modified folders are re-analyzed
+- **Timeless documentation** - focuses on high-level design, not implementation details
 
 See **[Codemap Skill](codemap.md)** for full documentation including manual commands and technical details.
 
@@ -90,7 +104,7 @@ See **[Clonedeps](clonedeps.md)** for the full workflow and file layout.
 
 **Heavy/complex coding sessions and large modifications workflow.**
 
-`deepwork` is an orchestrator-only workflow skill for managing deep architectural work, multi-phase implementations, and complex refactoring. It provides a structured approach with mandatory review gates while maintaining flexibility in planning.
+`deepwork` is an orchestrator-only workflow skill for managing deep architectural work, multi-phase implementations, and complex refactoring. It provides a structured approach with risk-based review gates while maintaining flexibility in planning.
 
 Start it directly with:
 
@@ -99,16 +113,27 @@ Start it directly with:
 ```
 
 **How it works:**
-1. Orchestrator creates a session artifact at `.slim/deepwork/<task>.md`
-2. Draft plan → Oracle review → Revise until acceptable
-3. Create phased implementation plan → Oracle review
-4. Execute phase by phase with validation
-5. After each phase: validate → Oracle review → fix issues → continue
+1. Before planning, delegation, or state creation, inspect `.gitignore` and
+   `.ignore`; add only missing entries (without duplicates) for
+   `.slim/deepwork/` in `.gitignore` and `!.slim/deepwork/` plus
+   `!.slim/deepwork/**` in `.ignore`. This keeps state git-local while making it
+   readable to OpenCode.
+2. Orchestrator creates a session artifact at `.slim/deepwork/<task>.md`
+3. Draft a phased implementation plan with a small number of coherent phases
+   based on dependencies and natural delivery boundaries. Do not split work
+   merely to make an Oracle review smaller.
+4. Before execution, show a compact overview of phase order, specialist
+   ownership/scope, the Oracle review total, the review after each phase, and a
+   short reason for each gate.
+5. Execute phase by phase: validate, update session state, then get an Oracle
+   review before advancing.
+6. Batch material findings into one bounded remediation pass with focused
+   validation. Re-review only when needed to assess a changed decision/risk or
+   an otherwise unverifiable concern.
 
 **Key features:**
 - Persistent session state in markdown files
-- Mandatory oracle reviews at plan and phase boundaries
-- Oracle phase reviews include simplify/readability feedback alongside regular correctness and risk review
+- Predictable Oracle reviews after each planned phase, declared before execution
 - V2 scheduler integration (dispatch specialists, wait for hook-driven completion, reconcile)
 - OpenCode todo lists for progress tracking
 - Flexible structure - orchestrator adapts format to task needs
@@ -119,6 +144,39 @@ Start it directly with:
 
 ---
 
+## verification-planning
+
+**Design project-specific evidence before non-trivial implementation.**
+
+`verification-planning` is an orchestrator-only skill for planning how a
+non-trivial implementation, bug fix, refactor, multi-layer change, or externally
+visible behavior will be proven before work begins. It starts with the claim to
+establish, its uncertainty and failure modes, then generates evidence paths from
+the system's controllable inputs, state transitions, boundaries, artifacts,
+invariants, reversibility, and repeatability rather than defaulting to familiar
+methods.
+
+When the system cannot expose decisive truth clearly enough, the skill may add a
+verification affordance: the smallest temporary or durable capability that makes
+the relevant state controllable, observable, repeatable, and diagnosable for an
+agent. This lets the agent improve the system's legibility instead of accepting
+weak, indirect evidence.
+
+It selects the narrowest path by credibility, signal quality, cost, safety, and
+independent inspectability or repeatability. When relevant project facilities or
+constraints are unfamiliar or rapidly changing, it asks `@librarian` for focused
+official and project-specific research before deciding; it does not seek generic
+testing advice or research when current evidence is already decisive.
+
+**When NOT to use:** tiny mechanical edits. It complements ordinary verification
+and deepwork, does not prescribe a default mechanism, and requires approval for
+verification-only dependencies, persistent instrumentation, production debug
+surfaces, or structural changes. Temporary support is removed; durable support
+needs a clear justification. Completed work reports what was established and its
+limitations.
+
+---
+
 ## reflect
 
 **Learn from repeated work and suggest practical workflow improvements.**
@@ -126,7 +184,7 @@ Start it directly with:
 `reflect` is an orchestrator-only workflow skill for reviewing recent work,
 finding repeated workflow friction, and recommending the smallest useful reusable
 asset. It may suggest a skill, custom agent, command, config rule, prompt rule,
-MCP permission change, or project playbook — but only when there is enough
+MCP permission change, or project playbook - but only when there is enough
 evidence.
 
 Use it directly with:
@@ -170,7 +228,8 @@ Safety defaults:
 - Pre-flight check on Git repo status and dirty worktrees.
 - Strict confirmation gates for all git modifications (`worktree add/remove`, `merge`, `rebase`, `cherry-pick`, `reset --hard`, branch operations).
 - Branch names default to `omo/<slug>` but respect custom user patterns.
-- Automated diff validation and compilation/test check before final integration.
+- Use a proportionate final-state verification plan before final integration,
+  including checks required by repository and release instructions.
 
 See **[Worktrees](worktrees.md)** for the detailed safety protocol.
 
@@ -208,32 +267,6 @@ After config changes, expect guidance like:
 ```text
 This should apply on the next OpenCode run; restart OpenCode if you need it immediately.
 ```
-
----
-
-## release-smoke-test
-
-**Validate packed release candidates and bugfixes before public publish.**
-
-`release-smoke-test` is an orchestrator-only skill for proving a release branch
-works as an installed package artifact. It builds and packs the candidate,
-installs the tarball into a throwaway app, runs OpenCode with a sanitized
-temporary config, verifies the active `plugin_origins`, and searches isolated
-logs for the crash signature being fixed.
-
-Use it for release hardening, runtime compatibility checks, and model-specific
-smokes such as OpenCode 1.17.11 malformed message transform regressions.
-
-Typical request:
-
-```text
-Use release-smoke-test to validate this release candidate before npm publish.
-```
-
-The skill distinguishes fully isolated smokes from host-provider smokes. If a
-model such as GPT-5.5 Fast needs provider aliases from the current machine, the
-skill records that limitation instead of treating it as equivalent to a clean
-`env -i` smoke.
 
 ---
 

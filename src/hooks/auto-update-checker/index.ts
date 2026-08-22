@@ -4,15 +4,24 @@ import {
   ensureCompanionVersion,
   loadCompanionManifestFromPackageRoot,
 } from '../../companion/updater';
+import { TOAST_DURATION_MS } from '../../config/constants';
 import { crossSpawn } from '../../utils/compat';
 import { log } from '../../utils/logger';
-import { preparePackageUpdate, resolveInstallContext } from './cache';
+import {
+  discardPreparedPackageUpdate,
+  preparePackageUpdate,
+  publishPackageUpdate,
+  resolveInstallContext,
+  verifyInstalledPackage,
+} from './cache';
 import {
   extractChannel,
   findPluginEntry,
   getCachedVersion,
+  getCurrentRuntimePackageJsonPath,
   getLatestCompatibleVersion,
   getLocalDevVersion,
+  updateInstallerManagedVersions,
 } from './checker';
 import { CACHE_DIR, PACKAGE_NAME } from './constants';
 import { syncBundledSkillsFromPackage } from './skill-sync';
@@ -60,6 +69,8 @@ export function createAutoUpdateCheckerHook(
   };
 }
 
+let hasReconciledAtStartup = false;
+
 /**
  * Orchestrates the version comparison and update process in the background.
  * @param ctx The plugin input context.
@@ -70,9 +81,54 @@ async function runBackgroundUpdateCheck(
   autoUpdate: boolean,
   companion: AutoUpdateCheckerOptions['companion'],
 ): Promise<void> {
+  const stagedSkillsThisUpdate = new Set<string>();
+
+  // Startup reconciliation (run once per top-level startup)
+  if (!hasReconciledAtStartup) {
+    try {
+      const runtimePackageJsonPath = getCurrentRuntimePackageJsonPath();
+      if (runtimePackageJsonPath) {
+        hasReconciledAtStartup = true;
+        const packageRoot = path.dirname(runtimePackageJsonPath);
+        log('[auto-update-checker] Running startup skill reconciliation');
+        const syncResult = syncBundledSkillsFromPackage(packageRoot);
+        for (const skill of syncResult.stagedThisSync) {
+          stagedSkillsThisUpdate.add(skill);
+        }
+        if (syncResult.installed.length > 0) {
+          log(
+            `[auto-update-checker] Startup skill sync installed: ${syncResult.installed.join(', ')}`,
+          );
+        }
+        if (syncResult.failed.length > 0) {
+          log(
+            `[auto-update-checker] Startup skill sync failures: ${syncResult.failed.join(', ')}`,
+          );
+        }
+        if (syncResult.staged.length > 0) {
+          log(
+            `[auto-update-checker] Startup skill sync staged: ${syncResult.staged.join(', ')}`,
+          );
+        }
+        if (syncResult.customized.length > 0) {
+          log(
+            `[auto-update-checker] Startup skill sync customized: ${syncResult.customized.join(', ')}`,
+          );
+        }
+      } else {
+        log(
+          '[auto-update-checker] Could not resolve runtime package path for startup skill reconciliation',
+        );
+      }
+    } catch (err) {
+      log('[auto-update-checker] Startup skill reconciliation failed:', err);
+    }
+  }
+
   const pluginInfo = findPluginEntry(ctx.directory);
   if (!pluginInfo) {
     log('[auto-update-checker] Plugin not found in config');
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -80,6 +136,7 @@ async function runBackgroundUpdateCheck(
   const currentVersion = cachedVersion ?? pluginInfo.pinnedVersion;
   if (!currentVersion) {
     log('[auto-update-checker] No version found (cached or pinned)');
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -98,6 +155,7 @@ async function runBackgroundUpdateCheck(
         8000,
       );
     }
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -106,6 +164,7 @@ async function runBackgroundUpdateCheck(
     log(
       `[auto-update-checker] Major update available; skipping auto-update: ${latestInfo.latestMajorVersion}`,
     );
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -115,6 +174,7 @@ async function runBackgroundUpdateCheck(
       '[auto-update-checker] Failed to fetch latest version for channel:',
       channel,
     );
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -123,6 +183,7 @@ async function runBackgroundUpdateCheck(
       '[auto-update-checker] Already on latest version for channel:',
       channel,
     );
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -139,6 +200,7 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log(`[auto-update-checker] Version is pinned; skipping auto-update.`);
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
@@ -151,11 +213,20 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] Auto-update disabled, notification only');
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
-  const installDir = preparePackageUpdate(latestVersion, PACKAGE_NAME);
-  if (!installDir) {
+  const cacheIdentity = pluginInfo.isInstallerManaged
+    ? latestVersion
+    : 'latest';
+  const prepared = preparePackageUpdate(
+    latestVersion,
+    PACKAGE_NAME,
+    undefined,
+    cacheIdentity,
+  );
+  if (!prepared) {
     showToast(
       ctx,
       `OMO-Slim ${latestVersion}`,
@@ -164,12 +235,32 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] Failed to prepare install root for auto-update');
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
     return;
   }
 
-  const installSuccess = await runBunInstallSafe(installDir);
+  const installSuccess =
+    (await runBunInstallSafe(prepared.stagingDir)) &&
+    verifyInstalledPackage(prepared.stagingDir, latestVersion);
+  const installDir = installSuccess
+    ? publishPackageUpdate(prepared, latestVersion)
+    : null;
+  if (!installSuccess) discardPreparedPackageUpdate(prepared);
 
-  if (installSuccess) {
+  if (installDir) {
+    if (
+      pluginInfo.isInstallerManaged &&
+      !updateInstallerManagedVersions(ctx.directory, latestVersion)
+    ) {
+      showToast(
+        ctx,
+        `OMO-Slim ${latestVersion}`,
+        'Update installed in cache, but plugin configuration could not be updated.',
+        'error',
+        8000,
+      );
+      return;
+    }
     let installedSkills: string[] = [];
     let companionUpdated = false;
     let companionWillRetry = false;
@@ -177,6 +268,12 @@ async function runBackgroundUpdateCheck(
     try {
       const syncResult = syncBundledSkillsFromPackage(packageRoot);
       installedSkills = syncResult.installed;
+      for (const skill of syncResult.stagedThisSync) {
+        stagedSkillsThisUpdate.add(skill);
+      }
+      for (const skill of [...syncResult.installed, ...syncResult.adopted]) {
+        stagedSkillsThisUpdate.delete(skill);
+      }
       if (syncResult.failed.length > 0) {
         log(
           `[auto-update-checker] Skill sync warnings/failures: ${syncResult.failed.join(', ')}`,
@@ -225,12 +322,17 @@ async function runBackgroundUpdateCheck(
     if (installedSkills.length > 0) {
       messageLines.push(`Added bundled skills: ${installedSkills.join(', ')}`);
     }
+    if (stagedSkillsThisUpdate.size > 0) {
+      messageLines.push(
+        `Staged skill updates require manual review: ${[...stagedSkillsThisUpdate].join(', ')}`,
+      );
+    }
     if (companionUpdated) {
       messageLines.push('Companion updated.');
     } else if (companionWillRetry) {
       messageLines.push('Companion update will retry on restart.');
     }
-    messageLines.push('Restart OpenCode to apply.');
+    messageLines.push('Restart OpenCode to apply the plugin update.');
 
     showToast(
       ctx,
@@ -251,6 +353,7 @@ async function runBackgroundUpdateCheck(
       8000,
     );
     log('[auto-update-checker] bun install failed; update not installed');
+    showStagedSkillsReviewToast(ctx, stagedSkillsThisUpdate);
   }
 }
 
@@ -261,6 +364,21 @@ function showMajorUpgradeToast(ctx: PluginInput, version: string): void {
     'It requires OpenCode background subagents.\nRun: bunx oh-my-opencode-slim@latest install',
     'info',
     12_000,
+  );
+}
+
+function showStagedSkillsReviewToast(
+  ctx: PluginInput,
+  stagedSkills: ReadonlySet<string>,
+): void {
+  if (stagedSkills.size === 0) return;
+
+  showToast(
+    ctx,
+    'Skill updates need review',
+    `Manual review required: ${[...stagedSkills].join(', ')}`,
+    'info',
+    8000,
   );
 }
 
@@ -317,7 +435,7 @@ function showToast(
   title: string,
   message: string,
   variant: 'info' | 'success' | 'error' = 'info',
-  duration = 3000,
+  duration = TOAST_DURATION_MS,
 ): void {
   ctx.client.tui
     .showToast({

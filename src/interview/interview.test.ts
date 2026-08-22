@@ -3,10 +3,22 @@ import * as fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import * as path from 'node:path';
 import { InterviewConfigSchema } from '../config/schema';
+import { INTERNAL_INITIATOR_METADATA_KEY } from '../utils';
 import { createInterviewServer } from './server';
-import { createInterviewService as createRealInterviewService } from './service';
+import {
+  createInterviewService as createRealInterviewService,
+  MAX_RETAINED_ABANDONED,
+} from './service';
 import type { InterviewAnswer } from './types';
 import { renderInterviewPage } from './ui';
+
+// Intercept getClient calls so service code uses the same session mocks
+// that test assertions inspect.
+mock.module('../utils/opencode-client', () => ({
+  getClient: (ctx: any) => ({
+    session: ctx._sessionMock ?? ctx.client.session,
+  }),
+}));
 
 // Mock the plugin context with mutable message array
 function createMockContext(overrides?: {
@@ -20,31 +32,37 @@ function createMockContext(overrides?: {
   // Use a mutable array that can be updated after creation
   const messagesData = overrides?.messagesData ?? [];
 
+  const sessionMock = {
+    messages: mock(async () => ({ data: messagesData })),
+    prompt: mock(async (args: any) => {
+      if (overrides?.promptImpl) {
+        return await overrides.promptImpl(args);
+      }
+      return {};
+    }),
+    promptAsync: mock(async (args: any) => {
+      if (overrides?.promptImpl) {
+        return await overrides.promptImpl(args);
+      }
+      return {};
+    }),
+    update: mock(async () => ({})),
+  };
+
   return {
     client: {
-      session: {
-        messages: mock(async () => ({ data: messagesData })),
-        prompt: mock(async (args: any) => {
-          if (overrides?.promptImpl) {
-            return await overrides.promptImpl(args);
-          }
-          return {};
-        }),
-        promptAsync: mock(async (args: any) => {
-          if (overrides?.promptImpl) {
-            return await overrides.promptImpl(args);
-          }
-          return {};
-        }),
-      },
+      session: sessionMock,
     },
     directory: overrides?.directory ?? '/test/directory',
+    _sessionMock: sessionMock,
   } as any;
 }
 
-// Helper to extract text from prompt calls
+// Helper to extract text from current v1 prompt calls (parts is in body)
 function getPromptTexts(promptMock: {
-  mock: { calls: Array<[{ body?: { parts?: Array<{ text?: string }> } }]> };
+  mock: {
+    calls: Array<[{ body?: { parts?: Array<{ text?: string }> } }]>;
+  };
 }): string[] {
   return promptMock.mock.calls
     .map((call) => call[0].body?.parts?.[0]?.text ?? '')
@@ -53,7 +71,9 @@ function getPromptTexts(promptMock: {
 
 // Helper to extract interview ID from the last prompt call
 function extractInterviewIdFromLastPrompt(promptMock: {
-  mock: { calls: Array<[{ body?: { parts?: Array<{ text?: string }> } }]> };
+  mock: {
+    calls: Array<[{ body?: { parts?: Array<{ text?: string }> } }]>;
+  };
 }): string | null {
   const calls = promptMock.mock.calls;
   if (calls.length === 0) return null;
@@ -127,7 +147,14 @@ describe('interview service', () => {
       const service = createInterviewService(ctx);
       // Set up base URL resolver to avoid server error
       service.setBaseUrlResolver(async () => 'http://localhost:9999');
-      const output = { parts: [] as Array<{ type: string; text?: string }> };
+      const output = {
+        parts: [] as Array<{
+          type: string;
+          text?: string;
+          synthetic?: boolean;
+          metadata?: Record<string, unknown>;
+        }>,
+      };
 
       await service.handleCommandExecuteBefore(
         {
@@ -143,6 +170,10 @@ describe('interview service', () => {
       expect(output.parts[0].type).toBe('text');
       expect(output.parts[0].text).toContain('My App Idea');
       expect(output.parts[0].text).toContain('<interview_state>');
+      expect(output.parts[0]).toMatchObject({
+        synthetic: true,
+        metadata: { [INTERNAL_INITIATOR_METADATA_KEY]: true },
+      });
 
       // Should send UI notification prompt to session
       expect(ctx.client.session.prompt).toHaveBeenCalled();
@@ -158,7 +189,56 @@ describe('interview service', () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     });
 
-    test('creates markdown file with slug-only filename (no timestamp prefix)', async () => {
+    test('renames session with interview title on creation', async () => {
+      const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+      const ctx = createMockContext({ directory: tempDir });
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+      const output = { parts: [] as Array<{ type: string; text?: string }> };
+
+      await service.handleCommandExecuteBefore(
+        {
+          command: 'interview',
+          sessionID: 'session-rename',
+          arguments: 'build a task manager',
+        },
+        output,
+      );
+
+      expect(ctx.client.session.update).toHaveBeenCalledTimes(1);
+      expect(ctx.client.session.update.mock.calls[0][0]).toEqual({
+        path: { id: 'session-rename' },
+        body: { title: 'Interview: build a task manager' },
+      });
+
+      await fs.rm(tempDir, { recursive: true, force: true });
+    });
+
+    test('truncates session title to 50 chars with ellipsis', async () => {
+      const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+      const ctx = createMockContext({ directory: tempDir });
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+      const output = { parts: [] as Array<{ type: string; text?: string }> };
+
+      const longIdea = 'a'.repeat(60);
+      await service.handleCommandExecuteBefore(
+        {
+          command: 'interview',
+          sessionID: 'session-truncate',
+          arguments: longIdea,
+        },
+        output,
+      );
+
+      const title = ctx.client.session.update.mock.calls[0][0].body.title;
+      expect(title.length).toBe(50);
+      expect(title.endsWith('…')).toBe(true);
+
+      await fs.rm(tempDir, { recursive: true, force: true });
+    });
+
+    test('creates markdown file with readable unique filename', async () => {
       const tempDir = await fs.mkdtemp('/tmp/interview-test-');
       const ctx = createMockContext({ directory: tempDir });
 
@@ -179,9 +259,11 @@ describe('interview service', () => {
       const interviewDir = path.join(tempDir, 'interview');
       const files = await fs.readdir(interviewDir);
       expect(files.length).toBe(1);
-      // Filename should be slug-only, no timestamp prefix
-      expect(files[0]).toBe('test-idea.md');
-      expect(files[0]).not.toMatch(/^\d+-/);
+      // The readable slug is followed by a UUID so concurrent interviews
+      // with the same idea cannot share a document.
+      expect(files[0]).toMatch(
+        /^test-idea-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.md$/,
+      );
 
       // Check file content structure
       const content = await fs.readFile(
@@ -662,6 +744,25 @@ describe('interview service', () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     });
 
+    test('/interview with no idea and no active interview asks for idea', async () => {
+      const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+      const ctx = createMockContext({ directory: tempDir });
+
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+
+      const output = { parts: [] as Array<{ type: string; text?: string }> };
+      await service.handleCommandExecuteBefore(
+        { command: 'interview', sessionID: 'fresh-session', arguments: '' },
+        output,
+      );
+
+      expect(output.parts).toHaveLength(1);
+      expect(output.parts[0].text).toContain('Ask them for the product idea');
+
+      await fs.rm(tempDir, { recursive: true, force: true });
+    });
+
     test('reusing same idea in same session returns existing interview', async () => {
       const tempDir = await fs.mkdtemp('/tmp/interview-test-');
       const ctx = createMockContext({ directory: tempDir });
@@ -829,7 +930,7 @@ describe('interview service', () => {
             info: {
               sessionID,
               providerID: 'openai',
-              modelID: 'gpt-5.4-mini',
+              modelID: 'gpt-5.6-luna',
             },
           },
         },
@@ -841,7 +942,7 @@ describe('interview service', () => {
       const call = ctx.client.session.promptAsync.mock.calls[0]?.[0];
       expect(call.body.model).toEqual({
         providerID: 'openai',
-        modelID: 'gpt-5.4-mini',
+        modelID: 'gpt-5.6-luna',
       });
 
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -875,7 +976,7 @@ describe('interview service', () => {
       const customDir = path.join(tempDir, 'custom-interviews');
       const files = await fs.readdir(customDir);
       expect(files.length).toBe(1);
-      expect(files[0]).toBe('custom-folder-idea.md');
+      expect(files[0]).toMatch(/^custom-folder-idea-[0-9a-f-]+\.md$/);
 
       // Verify the markdownPath in state points to custom folder
       const interviewId = extractInterviewIdFromLastPrompt(
@@ -915,7 +1016,7 @@ describe('interview service', () => {
       const nestedDir = path.join(tempDir, 'docs', 'interviews');
       const files = await fs.readdir(nestedDir);
       expect(files.length).toBe(1);
-      expect(files[0]).toBe('nested-path-idea.md');
+      expect(files[0]).toMatch(/^nested-path-idea-[0-9a-f-]+\.md$/);
 
       // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -1332,7 +1433,7 @@ describe('interview service', () => {
   });
 
   describe('agent-provided title', () => {
-    test('renames file when assistant provides title in interview_state', async () => {
+    test('keeps path stable and stores assistant title in markdown', async () => {
       const tempDir = await fs.mkdtemp('/tmp/interview-test-');
 
       // Start with empty messages
@@ -1364,7 +1465,9 @@ describe('interview service', () => {
       const interviewDir = path.join(tempDir, 'interview');
       let files = await fs.readdir(interviewDir);
       expect(files.length).toBe(1);
-      expect(files[0]).toBe('my-great-app-idea-with-long-description.md');
+      expect(files[0]).toMatch(
+        /^my-great-app-idea-with-long-description-[0-9a-f-]+\.md$/,
+      );
 
       const interviewId = extractInterviewIdFromLastPrompt(
         ctx.client.session.prompt,
@@ -1382,14 +1485,19 @@ describe('interview service', () => {
         ],
       });
 
-      // Sync interview (this triggers the rename)
+      // Sync interview (the assistant title updates Markdown, not its path)
       const state = await service.getInterviewState(requiredInterviewId);
 
-      // File should be renamed to use assistant-provided title
+      // The durable path remains tied to the record's original idea.
       files = await fs.readdir(interviewDir);
       expect(files.length).toBe(1);
-      expect(files[0]).toBe('task-manager.md');
-      expect(state.markdownPath).toContain('task-manager.md');
+      expect(files[0]).toMatch(
+        /^my-great-app-idea-with-long-description-[0-9a-f-]+\.md$/,
+      );
+      expect(state.markdownPath).toMatch(
+        /my-great-app-idea-with-long-description-[0-9a-f-]+\.md$/,
+      );
+      expect(state.document).toContain('# task-manager');
 
       // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -1423,7 +1531,7 @@ describe('interview service', () => {
 
       const interviewDir = path.join(tempDir, 'interview');
       let files = await fs.readdir(interviewDir);
-      expect(files[0]).toBe('simple-idea.md');
+      expect(files[0]).toMatch(/^simple-idea-[0-9a-f-]+\.md$/);
 
       const interviewId = extractInterviewIdFromLastPrompt(
         ctx.client.session.prompt,
@@ -1445,14 +1553,14 @@ describe('interview service', () => {
 
       // Filename should remain unchanged
       files = await fs.readdir(interviewDir);
-      expect(files[0]).toBe('simple-idea.md');
-      expect(state.markdownPath).toContain('simple-idea.md');
+      expect(files[0]).toMatch(/^simple-idea-[0-9a-f-]+\.md$/);
+      expect(state.markdownPath).toMatch(/simple-idea-[0-9a-f-]+\.md$/);
 
       // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
     });
 
-    test('does not rename if target filename already exists', async () => {
+    test('keeps shared path when title matches another file', async () => {
       const tempDir = await fs.mkdtemp('/tmp/interview-test-');
 
       const messagesData: Array<{
@@ -1488,7 +1596,10 @@ describe('interview service', () => {
       );
 
       let files = await fs.readdir(interviewDir);
-      expect(files).toContain('original-idea.md');
+      const originalPath = files.find((file) =>
+        file.startsWith('original-idea-'),
+      );
+      expect(originalPath).toBeDefined();
       expect(files).toContain('target-name.md');
 
       const interviewId = extractInterviewIdFromLastPrompt(
@@ -1509,11 +1620,16 @@ describe('interview service', () => {
 
       const state = await service.getInterviewState(requiredInterviewId);
 
-      // Should not rename (would overwrite existing file)
+      // The active document keeps its path and the unrelated file remains
+      // untouched.
       files = await fs.readdir(interviewDir);
-      expect(files).toContain('original-idea.md');
+      expect(files).toContain(originalPath as string);
       expect(files).toContain('target-name.md');
-      expect(state.markdownPath).toContain('original-idea.md');
+      expect(state.markdownPath).toMatch(/original-idea-[0-9a-f-]+\.md$/);
+      expect(state.document).toContain('# target-name');
+      expect(
+        await fs.readFile(path.join(interviewDir, 'target-name.md'), 'utf8'),
+      ).toContain('Existing.');
 
       // Cleanup
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -1890,5 +2006,134 @@ describe('InterviewConfigSchema port validation', () => {
 
   test('rejects float port', () => {
     expect(() => InterviewConfigSchema.parse({ port: 3.5 })).toThrow();
+  });
+});
+
+describe('interview service abandoned-record retention', () => {
+  const RETENTION_CAP = MAX_RETAINED_ABANDONED;
+
+  async function createInterviewOnSession(
+    service: ReturnType<typeof createInterviewService>,
+    ctx: ReturnType<typeof createMockContext>,
+    index: number,
+  ): Promise<string> {
+    const output = { parts: [] as Array<{ type: string; text?: string }> };
+    await service.handleCommandExecuteBefore(
+      {
+        command: 'interview',
+        sessionID: `session-${index}`,
+        arguments: `Idea ${index}`,
+      },
+      output,
+    );
+    return requireInterviewId(
+      extractInterviewIdFromLastPrompt(ctx.client.session.prompt),
+    );
+  }
+
+  test('evicts oldest abandoned records once the retention cap is exceeded', async () => {
+    const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+    try {
+      const ctx = createMockContext({ directory: tempDir });
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+
+      const ids: string[] = [];
+      for (let i = 0; i < RETENTION_CAP + 2; i++) {
+        ids.push(await createInterviewOnSession(service, ctx, i));
+        // Deleting the session abandons the interview, triggering pruning.
+        await service.handleEvent({
+          event: {
+            type: 'session.deleted',
+            properties: { sessionID: `session-${i}` },
+          },
+        });
+      }
+
+      // The two oldest abandoned records are evicted from the registry.
+      await expect(service.getInterviewState(ids[0])).rejects.toThrow(
+        'Interview not found',
+      );
+      await expect(service.getInterviewState(ids[1])).rejects.toThrow(
+        'Interview not found',
+      );
+
+      // The most recent abandoned record is retained and still renders.
+      const retained = await service.getInterviewState(ids[ids.length - 1]);
+      expect(retained.mode).toBe('abandoned');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('prunes by abandonment order instead of creation order', async () => {
+    const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+    try {
+      const ctx = createMockContext({ directory: tempDir });
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+
+      const oldActiveId = await createInterviewOnSession(service, ctx, 0);
+      const abandonedIds: string[] = [];
+
+      for (let i = 1; i <= RETENTION_CAP; i++) {
+        const id = await createInterviewOnSession(service, ctx, i);
+        abandonedIds.push(id);
+        await service.handleEvent({
+          event: {
+            type: 'session.deleted',
+            properties: { sessionID: `session-${i}` },
+          },
+        });
+      }
+
+      // Abandoning the old active interview after the cap is full should retain
+      // that newly abandoned record and prune the earliest previously abandoned
+      // record. Its older createdAt must not make it the eviction candidate.
+      await service.handleEvent({
+        event: {
+          type: 'session.deleted',
+          properties: { sessionID: 'session-0' },
+        },
+      });
+
+      await expect(service.getInterviewState(abandonedIds[0])).rejects.toThrow(
+        'Interview not found',
+      );
+
+      const oldActiveState = await service.getInterviewState(oldActiveId);
+      expect(oldActiveState.mode).toBe('abandoned');
+
+      const latestPreviouslyAbandoned = await service.getInterviewState(
+        abandonedIds[abandonedIds.length - 1],
+      );
+      expect(latestPreviouslyAbandoned.mode).toBe('abandoned');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('retains abandoned records that stay within the cap', async () => {
+    const tempDir = await fs.mkdtemp('/tmp/interview-test-');
+    try {
+      const ctx = createMockContext({ directory: tempDir });
+      const service = createInterviewService(ctx);
+      service.setBaseUrlResolver(async () => 'http://localhost:9999');
+
+      const id = await createInterviewOnSession(service, ctx, 0);
+      await service.handleEvent({
+        event: {
+          type: 'session.deleted',
+          properties: { sessionID: 'session-0' },
+        },
+      });
+
+      // Below the cap, the abandoned record is kept so an open tab can still
+      // render its final state.
+      const state = await service.getInterviewState(id);
+      expect(state.mode).toBe('abandoned');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -17,6 +17,25 @@ export interface TaskStatusOutput {
   result?: string;
 }
 
+/**
+ * Static, deterministic placeholder for a still-running background task tool
+ * result. Keyed only on the task ID so re-rendering across consecutive
+ * requests produces byte-identical output regardless of any live progress the
+ * runtime may stream into the tool part's `state.output`. Keeping running
+ * results byte-stable prevents provider prompt-cache invalidation mid-history
+ * while a background lane is active.
+ */
+export function renderRunningTaskPlaceholder(taskID: string): string {
+  return [
+    `<task id="${taskID}" state="running">`,
+    '<summary>Background task running</summary>',
+    '<task_result>',
+    'The task is working in the background. You will be notified automatically when it finishes.',
+    '</task_result>',
+    '</task>',
+  ].join('\n');
+}
+
 export function parseTaskIdFromTaskOutput(output: string): string | undefined {
   const xmlMatch = /<task\s+[^>]*\bid=["']([^"']+)["'][^>]*>/i.exec(output);
   if (xmlMatch) return xmlMatch[1];

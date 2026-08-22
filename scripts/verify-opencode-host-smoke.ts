@@ -293,17 +293,20 @@ async function verifyHostSmoke(tarballPath: string) {
         ),
         exitPromise,
       ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assertNoPluginLoadErrors(`${stdout}\n${stderr}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       fail(
         `${message}\nCaptured OpenCode logs:\n${formatCapturedLogs(stdout, stderr)}`,
       );
+    } finally {
+      // Always terminate the spawned server, including on the health-check
+      // failure path where stopProcess would otherwise never be reached and
+      // the child process would leak away after the temp dir is removed.
+      await stopProcess(child);
     }
-
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    assertNoPluginLoadErrors(`${stdout}\n${stderr}`);
-
-    await stopProcess(child);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

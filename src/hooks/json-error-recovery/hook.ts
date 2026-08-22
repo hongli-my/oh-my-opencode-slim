@@ -6,7 +6,6 @@ export const JSON_ERROR_TOOL_EXCLUDE_LIST = [
   'glob',
   'webfetch',
   'gh_grep_searchgithub',
-  'websearch_web_search_exa',
 ] as const;
 
 export const JSON_ERROR_PATTERNS = [

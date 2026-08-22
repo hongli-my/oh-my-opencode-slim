@@ -13,7 +13,7 @@
 | Doc | Contents |
 |-----|----------|
 | [Council Agent](council.md) | Multi-LLM consensus, presets, role prompts, timeouts |
-| [Background Orchestration](v2-background-orchestration.md) | Default scheduler-first orchestrator model for native background subagents |
+| [Background Orchestration](background-orchestration.md) | Default scheduler-first orchestrator model for native background subagents |
 | [Interview](interview.md) | `/interview` command, browser UI, dashboard mode, multi-session coordination |
 | [Multiplexer Integration](multiplexer-integration.md) | Real-time pane monitoring, layouts, troubleshooting |
 | [Preset Switching](preset-switching.md) | `/preset` command for runtime agent model switching |
@@ -23,8 +23,8 @@
 
 | Doc | Contents |
 |-----|----------|
-| [Skills](skills.md) | `simplify`, `codemap`, `clonedeps` — skills assignment syntax |
-| [MCPs](mcps.md) | `websearch`, `context7`, `gh_grep` — permissions per agent, global disable |
+| [Skills](skills.md) | `simplify`, `codemap`, `clonedeps` - skills assignment syntax |
+| [MCPs](mcps.md) | `context7`, `gh_grep` - permissions per agent, global disable |
 | [Tools](tools.md) | Background tasks, LSP, code search (`ast_grep`), formatters |
 | [Configuration](configuration.md) | Config files, prompt overriding, JSONC, full option reference table |
 
@@ -32,4 +32,4 @@
 
 | Doc | Contents |
 |-----|----------|
-| [Author's Preset](authors-preset.md) | The exact config the author runs daily — OpenAI + Fireworks AI + GitHub Copilot |
+| [Author's Preset](authors-preset.md) | The exact config the author runs daily - OpenAI + Fireworks AI + GitHub Copilot |

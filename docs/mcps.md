@@ -1,6 +1,24 @@
 # MCP Servers
 
-Built-in Model Context Protocol (MCP) servers ship with oh-my-opencode-slim and give agents access to external tools — web search, library documentation, and code search.
+Built-in Model Context Protocol (MCP) servers ship with oh-my-opencode-slim and give agents access to external tools - library documentation and code search.
+
+---
+
+## Built-in websearch (recommended)
+
+The plugin no longer ships a websearch MCP. OpenCode has a built-in `websearch` tool that replaces it, so you do not need an API key or an extra MCP server.
+
+Enable the built-in tool by setting these environment variables in your shell profile or launch command:
+
+```sh
+env OPENCODE_ENABLE_EXA=true OPENCODE_ENABLE_PARALLEL=true opencode
+```
+
+The oh-my-opencode-slim installer sets `OPENCODE_ENABLE_EXA=1` alongside its
+background-subagents export when you accept the environment setup. Parallel
+search remains opt-in.
+
+The built-in tool is Exa-backed (optionally Parallel), needs no API key, and is only available when using the `opencode` provider OR when those flags are set. Control access per agent with `permission: { "websearch": "allow" }` (all tools are allowed by default).
 
 ---
 
@@ -8,7 +26,6 @@ Built-in Model Context Protocol (MCP) servers ship with oh-my-opencode-slim and 
 
 | MCP | Purpose | Endpoint |
 |-----|---------|----------|
-| `websearch` | Real-time web search via Exa AI | `https://mcp.exa.ai/mcp` |
 | `context7` | Official library documentation (up-to-date) | `https://mcp.context7.com/mcp` |
 | `gh_grep` | GitHub code search via grep.app | `https://mcp.grep.app` |
 
@@ -19,7 +36,7 @@ Built-in Model Context Protocol (MCP) servers ship with oh-my-opencode-slim and 
 | Agent | Default MCPs |
 |-------|-------------|
 | `orchestrator` | `*`, `!context7` |
-| `librarian` | `websearch`, `context7`, `gh_grep` |
+| `librarian` | `context7`, `gh_grep` |
 | `designer` | none |
 | `oracle` | none |
 | `explorer` | none |
@@ -36,7 +53,7 @@ Control which MCPs each agent can use via the `mcps` array in your preset config
 |--------|---------|
 | `["*"]` | All MCPs |
 | `["*", "!context7"]` | All MCPs except `context7` |
-| `["websearch", "context7"]` | Only listed MCPs |
+| `["context7", "gh_grep"]` | Only listed MCPs |
 | `[]` | No MCPs |
 | `["!*"]` | Deny all MCPs |
 
@@ -55,10 +72,10 @@ Control which MCPs each agent can use via the `mcps` array in your preset config
         "mcps": ["*", "!context7"]
       },
       "librarian": {
-        "mcps": ["websearch", "context7", "gh_grep"]
+        "mcps": ["context7", "gh_grep"]
       },
       "oracle": {
-        "mcps": ["*", "!websearch"]
+        "mcps": ["*", "!gh_grep"]
       },
       "fixer": {
         "mcps": []
@@ -76,7 +93,7 @@ To disable specific MCPs for all agents regardless of preset, add them to `disab
 
 ```json
 {
-  "disabled_mcps": ["websearch"]
+  "disabled_mcps": ["gh_grep"]
 }
 ```
 

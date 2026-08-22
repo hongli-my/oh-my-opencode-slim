@@ -2,10 +2,16 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { RGBA } from '@opentui/core';
+import { readTmuxPane } from './multiplexer/tmux-pane-registry';
 import {
+  type ActiveTmuxPaneRegistration,
+  getContrastForeground,
   getSidebarAgentNames,
+  readCompactSidebar,
   readConfigInvalid,
   splitSidebarModelId,
+  syncTmuxPaneRegistration,
   default as tuiPlugin,
 } from './tui';
 import type { TuiSnapshot } from './tui-state';
@@ -25,8 +31,8 @@ describe('tui sidebar agents', () => {
     const agentNames = getSidebarAgentNames(
       createSnapshot({
         agentModels: {
-          explorer: 'openai/gpt-5.4-mini',
-          fixer: 'openai/gpt-5.4-mini',
+          explorer: 'openai/gpt-5.6-luna',
+          fixer: 'openai/gpt-5.6-luna',
         },
       }),
     );
@@ -49,9 +55,9 @@ describe('tui sidebar agents', () => {
 
 describe('splitSidebarModelId', () => {
   test('splits provider from model at the first slash', () => {
-    expect(splitSidebarModelId('openai/gpt-5.5-fast')).toEqual({
+    expect(splitSidebarModelId('openai/gpt-5.6-fast')).toEqual({
       provider: 'openai',
-      model: 'gpt-5.5-fast',
+      model: 'gpt-5.6-fast',
     });
     expect(
       splitSidebarModelId(
@@ -119,6 +125,84 @@ describe('readConfigInvalid', () => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  test('returns false for config with deprecated fallback keys (loads fine)', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui-'));
+    try {
+      const projectDir = path.join(tempDir, 'project');
+      const configDir = path.join(projectDir, '.opencode');
+      fs.mkdirSync(configDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          fallback: {
+            enabled: true,
+            timeoutMs: 15000,
+            runtimeOverride: true,
+          },
+          agents: { oracle: { model: 'valid/model' } },
+        }),
+      );
+
+      // Deprecated fallback keys are stripped with a warning; the config
+      // loads successfully so the sidebar must NOT show "Config invalid".
+      expect(readConfigInvalid(projectDir)).toBe(false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('returns false for config with normalized disabled_* string', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui-'));
+    try {
+      const projectDir = path.join(tempDir, 'project');
+      const configDir = path.join(projectDir, '.opencode');
+      fs.mkdirSync(configDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          disabled_agents: 'explorer',
+          agents: { oracle: { model: 'valid/model' } },
+        }),
+      );
+
+      // The string key is normalized to an array with a 'normalized' warning
+      // (not invalid-schema), so the config loads fine and the sidebar must
+      // NOT show "Config invalid".
+      expect(readConfigInvalid(projectDir)).toBe(false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('uses compact sidebar by default', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui-'));
+    try {
+      const projectDir = path.join(tempDir, 'project');
+      fs.mkdirSync(projectDir, { recursive: true });
+
+      expect(readCompactSidebar(projectDir)).toBe(true);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('allows expanded sidebar config', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tui-'));
+    try {
+      const projectDir = path.join(tempDir, 'project');
+      const configDir = path.join(projectDir, '.opencode');
+      fs.mkdirSync(configDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({ compactSidebar: false }),
+      );
+
+      expect(readCompactSidebar(projectDir)).toBe(false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('tui plugin env disable', () => {
@@ -164,5 +248,102 @@ describe('tui plugin env disable', () => {
     expect(registered).toBe(false);
     expect(disposeRegistered).toBe(false);
     expect(renderRequested).toBe(false);
+  });
+});
+
+describe('tmux pane registration', () => {
+  let originalEnv: typeof process.env;
+  let stateDirectory: string;
+
+  beforeEach(() => {
+    originalEnv = { ...process.env };
+    stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-tmux-tui-'));
+    process.env.XDG_DATA_HOME = stateDirectory;
+    process.env.TMUX_PANE = '%42';
+  });
+
+  afterEach(() => {
+    fs.rmSync(stateDirectory, { recursive: true, force: true });
+    process.env = originalEnv;
+  });
+
+  test('records the local pane for the active attached session', () => {
+    const registration: ActiveTmuxPaneRegistration = {
+      ownerPid: 100,
+      lastRecordedAt: 0,
+    };
+    const api = {
+      route: {
+        current: { name: 'session', params: { sessionID: 'root-session-b' } },
+      },
+    };
+
+    syncTmuxPaneRegistration(api as never, registration, 1_000);
+
+    expect(readTmuxPane('root-session-b', 1_000)).toBe('%42');
+  });
+
+  test('moves registration when the local TUI selects another session', () => {
+    const registration: ActiveTmuxPaneRegistration = {
+      ownerPid: 100,
+      lastRecordedAt: 0,
+    };
+    const api = {
+      route: {
+        current: { name: 'session', params: { sessionID: 'root-a' } },
+      },
+    };
+
+    syncTmuxPaneRegistration(api as never, registration, 1_000);
+    api.route.current.params.sessionID = 'root-b';
+    syncTmuxPaneRegistration(api as never, registration, 2_000);
+
+    expect(readTmuxPane('root-a', 2_000)).toBeUndefined();
+    expect(readTmuxPane('root-b', 2_000)).toBe('%42');
+  });
+});
+
+describe('getContrastForeground', () => {
+  const white = RGBA.fromInts(255, 255, 255);
+  const black = RGBA.fromInts(0, 0, 0);
+  const darkGray = RGBA.fromInts(30, 30, 30);
+  const transparent = RGBA.fromInts(0, 0, 0, 0);
+
+  test('returns theme text when fallback is triggered', () => {
+    expect(getContrastForeground(undefined, 'theme-text', 'theme-bg')).toBe(
+      'theme-text',
+    );
+  });
+
+  test('returns black on a light background', () => {
+    // White background -> black text
+    const result = getContrastForeground(white, white, black) as RGBA;
+    expect(result.toInts()).toEqual([0, 0, 0, 255]);
+  });
+
+  test('returns white on a dark background', () => {
+    // Black background -> white text
+    const result = getContrastForeground(black, white, black) as RGBA;
+    expect(result.toInts()).toEqual([255, 255, 255, 255]);
+  });
+
+  test('respects themeBackground if it is dark and solid when accent is light', () => {
+    const result = getContrastForeground(white, white, darkGray) as RGBA;
+    expect(result.toInts()).toEqual([30, 30, 30, 255]);
+  });
+
+  test('never returns transparent themeBackground even if accent is light', () => {
+    const result = getContrastForeground(white, white, transparent) as RGBA;
+    expect(result.toInts()).toEqual([0, 0, 0, 255]);
+  });
+
+  test('respects themeText if it is light when accent is dark', () => {
+    const result = getContrastForeground(black, white, black) as RGBA;
+    expect(result.toInts()).toEqual([255, 255, 255, 255]);
+  });
+
+  test('parses hex string colors correctly', () => {
+    const result = getContrastForeground('#ffffff', '#ffffff', '#1e1e1e');
+    expect(result).toBe('#1e1e1e');
   });
 });

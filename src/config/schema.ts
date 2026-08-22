@@ -1,14 +1,6 @@
 import { z } from 'zod';
+import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from './constants';
 import { CouncilConfigSchema } from './council-schema';
-
-const MANUAL_AGENT_NAMES = [
-  'orchestrator',
-  'oracle',
-  'designer',
-  'explorer',
-  'librarian',
-  'fixer',
-] as const;
 
 export const ProviderModelIdSchema = z
   .string()
@@ -17,42 +9,45 @@ export const ProviderModelIdSchema = z
     'Expected provider/model format (provider/.../model)',
   );
 
-export const ManualAgentPlanSchema = z
-  .object({
-    primary: ProviderModelIdSchema,
-    fallback1: ProviderModelIdSchema,
-    fallback2: ProviderModelIdSchema,
-    fallback3: ProviderModelIdSchema,
-  })
-  .superRefine((value, ctx) => {
-    const unique = new Set([
-      value.primary,
-      value.fallback1,
-      value.fallback2,
-      value.fallback3,
-    ]);
-    if (unique.size !== 4) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'primary and fallbacks must be unique per agent',
-      });
-    }
-  });
+// Permission schemas — mirror the SDK's PermissionConfig type with shallow
+// validation. Action values are validated; unknown tool keys pass through.
+const PermissionActionSchema = z.enum(['ask', 'allow', 'deny']);
 
-export const ManualPlanSchema = z
-  .object({
-    orchestrator: ManualAgentPlanSchema,
-    oracle: ManualAgentPlanSchema,
-    designer: ManualAgentPlanSchema,
-    explorer: ManualAgentPlanSchema,
-    librarian: ManualAgentPlanSchema,
-    fixer: ManualAgentPlanSchema,
-  })
-  .strict();
+// A rule key accepts either a single action (whole-tool default) or a
+// pattern→action map (e.g. bash: { "git status*": "allow", "*": "ask" })
+const PermissionRuleSchema = z.union([
+  PermissionActionSchema,
+  z.record(z.string(), PermissionActionSchema),
+]);
 
-export type ManualAgentName = (typeof MANUAL_AGENT_NAMES)[number];
-export type ManualAgentPlan = z.infer<typeof ManualAgentPlanSchema>;
-export type ManualPlan = z.infer<typeof ManualPlanSchema>;
+// Known keys are typed for typo protection; .catchall() types the index
+// signature to match the SDK's PermissionConfig, so no cast is needed at
+// the assignment site. Unknown tool keys are still validated as rules.
+const PermissionObjectSchema = z
+  .object({
+    read: PermissionRuleSchema.optional(),
+    edit: PermissionRuleSchema.optional(),
+    glob: PermissionRuleSchema.optional(),
+    grep: PermissionRuleSchema.optional(),
+    list: PermissionRuleSchema.optional(),
+    bash: PermissionRuleSchema.optional(),
+    task: PermissionRuleSchema.optional(),
+    external_directory: PermissionRuleSchema.optional(),
+    lsp: PermissionRuleSchema.optional(),
+    skill: PermissionRuleSchema.optional(),
+    todowrite: PermissionActionSchema.optional(),
+    question: PermissionActionSchema.optional(),
+    webfetch: PermissionActionSchema.optional(),
+    websearch: PermissionActionSchema.optional(),
+    codesearch: PermissionActionSchema.optional(),
+    doom_loop: PermissionActionSchema.optional(),
+  })
+  .catchall(PermissionRuleSchema);
+
+export const PermissionConfigSchema = z.union([
+  PermissionActionSchema,
+  PermissionObjectSchema,
+]);
 
 // Agent override configuration (distinct from SDK's AgentConfig)
 export const AgentOverrideConfigSchema = z
@@ -81,6 +76,8 @@ export const AgentOverrideConfigSchema = z
     orchestratorPrompt: z.string().min(1).optional(),
     options: z.record(z.string(), z.unknown()).optional(), // provider-specific model options (e.g., textVerbosity, thinking budget)
     displayName: z.string().min(1).optional(),
+    description: z.string().min(1).optional(),
+    permission: PermissionConfigSchema.optional(), // tool-level permission rules enforced by the SDK
   })
   .strict();
 
@@ -90,6 +87,8 @@ export const MultiplexerTypeSchema = z.enum([
   'tmux',
   'zellij',
   'herdr',
+  'kitty',
+  'cmux',
   'none',
 ]);
 export type MultiplexerType = z.infer<typeof MultiplexerTypeSchema>;
@@ -109,10 +108,6 @@ export type MultiplexerLayout = z.infer<typeof MultiplexerLayoutSchema>;
 export const ZellijPaneModeSchema = z.enum(['agent-tab', 'current-tab']);
 export type ZellijPaneMode = z.infer<typeof ZellijPaneModeSchema>;
 
-// Legacy Tmux layout options (for backward compatibility)
-export const TmuxLayoutSchema = MultiplexerLayoutSchema;
-export type TmuxLayout = MultiplexerLayout;
-
 // Multiplexer integration configuration (new unified config)
 export const MultiplexerConfigSchema = z.object({
   type: MultiplexerTypeSchema.default('none'),
@@ -123,16 +118,6 @@ export const MultiplexerConfigSchema = z.object({
 
 export type MultiplexerConfig = z.infer<typeof MultiplexerConfigSchema>;
 
-// Legacy Tmux integration configuration (for backward compatibility)
-// When tmux.enabled is true, it's equivalent to multiplexer.type = 'tmux'
-export const TmuxConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  layout: TmuxLayoutSchema.default('main-vertical'),
-  main_pane_size: z.number().min(20).max(80).default(60), // percentage for main pane
-});
-
-export type TmuxConfig = z.infer<typeof TmuxConfigSchema>;
-
 export type AgentOverrideConfig = z.infer<typeof AgentOverrideConfigSchema>;
 
 /** Normalized model entry with optional per-model variant. */
@@ -142,19 +127,22 @@ export const PresetSchema = z.record(z.string(), AgentOverrideConfigSchema);
 
 export type Preset = z.infer<typeof PresetSchema>;
 
-// Websearch provider configuration
-export const WebsearchConfigSchema = z.object({
-  provider: z.enum(['exa', 'tavily']).default('exa'),
-});
-export type WebsearchConfig = z.infer<typeof WebsearchConfigSchema>;
-
 // MCP names
-export const McpNameSchema = z.enum(['websearch', 'context7', 'gh_grep']);
+export const McpNameSchema = z.enum(['context7', 'gh_grep']);
 export type McpName = z.infer<typeof McpNameSchema>;
+
+const InterviewOutputFolderSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .regex(
+    /^(?![\\/])(?![A-Za-z]:[\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$)).+$/,
+    'outputFolder must be a relative path without parent-directory traversal',
+  );
 
 export const InterviewConfigSchema = z.object({
   maxQuestions: z.number().int().min(1).max(10).default(2),
-  outputFolder: z.string().min(1).default('interview'),
+  outputFolder: InterviewOutputFolderSchema.default('interview'),
   autoOpenBrowser: z
     .boolean()
     .default(true)
@@ -168,27 +156,116 @@ export const InterviewConfigSchema = z.object({
 export type InterviewConfig = z.infer<typeof InterviewConfigSchema>;
 
 export const BackgroundJobsConfigSchema = z.object({
+  strategy: z
+    .enum(['latest', 'checkpoint-compatible'])
+    .default('latest')
+    .describe(
+      'Board injection strategy. "latest" replaces prior board messages; "checkpoint-compatible" preserves them and appends only changed board snapshots.',
+    ),
   maxSessionsPerAgent: z.number().int().min(1).max(10).default(2),
+  maxContextLines: z.number().int().min(0).max(500_000).default(50_000),
   readContextMinLines: z.number().int().min(0).max(1000).default(10),
   readContextMaxFiles: z.number().int().min(0).max(50).default(8),
+  maxRetainedSnapshots: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .default(DEFAULT_MAX_RETAINED_SNAPSHOTS)
+    .describe(
+      'Maximum board snapshots retained per checkpoint cache epoch (1–100). Exceeding the limit starts a new epoch with the current snapshot and intentionally creates one cache miss.',
+    ),
+  orchestratorWake: z
+    .object({
+      enabled: z
+        .boolean()
+        .default(true)
+        .describe(
+          'When true, idle orchestrator sessions with incomplete todos may receive periodic internal wake prompts. Default enabled.',
+        ),
+      intervalMs: z
+        .number()
+        .int()
+        .min(60_000)
+        .max(2_147_483_647)
+        .default(300_000)
+        .describe(
+          'Continuous parent-idle interval between orchestrator wake evaluations (60,000–2,147,483,647ms). Default 300,000 (5 minutes). 0 is invalid.',
+        ),
+    })
+    .default({ enabled: true, intervalMs: 300_000 })
+    .describe(
+      'Periodic orchestrator wake scheduler for idle sessions with incomplete todos. Default enabled at a 5-minute interval. Requires host session APIs (session.get, todo, children, status, promptAsync); inactive on the v2 shim.',
+    ),
+  wallClockTimeoutMs: z
+    .union([z.literal(0), z.number().int().min(60_000).max(2_147_483_647)])
+    .default(0)
+    .describe(
+      'Explicit opt-in wall-clock deadline for native task(..., background: true) child sessions. 0 disables supervision; finite values are 60,000–2,147,483,647ms.',
+    ),
+  abortGraceMs: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(60_000)
+    .default(10_000)
+    .describe(
+      'Grace period after a wall-clock deadline while OpenCode confirms the child terminal state (1,000–60,000ms).',
+    ),
 });
 
 export type BackgroundJobsConfig = z.infer<typeof BackgroundJobsConfigSchema>;
 
-export const FailoverConfigSchema = z
-  .object({
-    enabled: z.boolean().default(true),
-    timeoutMs: z.number().min(0).default(15000),
-    retryDelayMs: z.number().min(0).default(500),
-    retry_on_empty: z
-      .boolean()
-      .default(true)
-      .describe(
-        'When true (default), empty provider responses are treated as failures, ' +
-          'triggering fallback/retry. Set to false to treat them as successes.',
-      ),
-  })
-  .strict();
+/**
+ * Fallback config fields accepted by versions before 2.3.x but no longer
+ * meaningful. Kept only so that existing user/project configs containing
+ * them still parse: the loader emits a deprecation warning and these keys
+ * are stripped before strict validation. Without this, a stale field would
+ * make the whole config file fail and drop all the user's settings.
+ */
+export const LEGACY_FALLBACK_KEYS = [
+  'timeoutMs',
+  'retryDelayMs',
+  'retry_on_empty',
+  'runtimeOverride',
+] as const;
+
+function stripLegacyFallbackKeys(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const hasLegacy = LEGACY_FALLBACK_KEYS.some((key) => key in record);
+  if (!hasLegacy) {
+    return value;
+  }
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(record)) {
+    if (!(LEGACY_FALLBACK_KEYS as readonly string[]).includes(key)) {
+      cleaned[key] = val;
+    }
+  }
+  return cleaned;
+}
+
+export const FailoverConfigSchema = z.preprocess(
+  stripLegacyFallbackKeys,
+  z
+    .object({
+      enabled: z.boolean().default(true),
+      maxRetries: z
+        .number()
+        .int()
+        .min(0)
+        .default(3)
+        .describe(
+          'Number of consecutive 429/rate-limit responses tolerated on the ' +
+            'same model before aborting (or swapping to the next fallback ' +
+            'model when a chain is configured).',
+        ),
+    })
+    .strict(),
+);
 
 export type FailoverConfig = z.infer<typeof FailoverConfigSchema>;
 
@@ -226,6 +303,24 @@ export const CompanionConfigSchema = z.object({
 });
 
 export type CompanionConfig = z.infer<typeof CompanionConfigSchema>;
+
+export const WebfetchConfigSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .default(true)
+      .describe(
+        'When false, skip registering this enhanced webfetch so OpenCode uses its built-in version.',
+      ),
+    model: AgentOverrideConfigSchema.shape.model.describe(
+      'Dedicated model(s) for smartfetch secondary-model summarization. ' +
+        'Same shape as agent model config (string, array of strings/objects with id+variant). ' +
+        'Takes priority over small_model, agents.explorer.model, and agents.librarian.model.',
+    ),
+  })
+  .strict();
+
+export type WebfetchConfig = z.infer<typeof WebfetchConfigSchema>;
 
 export const AcpAgentPermissionModeSchema = z.enum(['ask', 'allow', 'reject']);
 
@@ -286,7 +381,15 @@ export const PluginConfigSchema = z
     compactSidebar: z
       .boolean()
       .optional()
-      .describe('Use the compact TUI sidebar layout when enabled.'),
+      .describe(
+        'Use the compact TUI sidebar layout. Defaults to true; set false to use the expanded layout.',
+      ),
+    stripOrchestratorModel: z
+      .boolean()
+      .optional()
+      .describe(
+        'When true, omit orchestrator.model and orchestrator.variant from the SDK config so OpenCode uses the session model selected with /model after subagent dispatch. An explicitly selected preset that sets orchestrator.model is preserved. Defaults to false.',
+      ),
     autoUpdate: z
       .boolean()
       .optional()
@@ -304,7 +407,24 @@ export const PluginConfigSchema = z
           'Orchestrator and council internal agents (councillor) cannot be disabled. ' +
           "By default, 'observer' is disabled. Remove it from this list and configure a vision-capable model to enable.",
       ),
-    disabled_mcps: z.array(z.string()).optional(),
+    image_routing: z
+      .enum(['auto', 'direct'])
+      .optional()
+      .describe(
+        'How image attachments are handled. ' +
+          'When omitted, preserves legacy conditional behavior: intercept ' +
+          'attachments only when observer is enabled. "auto": requires ' +
+          'observer to be enabled and saves attachments to disk before ' +
+          'nudging delegation to @observer. "direct": always passes ' +
+          'attachments to the orchestrator untouched.',
+      ),
+    disabled_mcps: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'MCP server names to disable completely. Disabled servers are not ' +
+          'started and cannot be used by agents.',
+      ),
     disabled_tools: z
       .array(z.string())
       .optional()
@@ -317,17 +437,14 @@ export const PluginConfigSchema = z
       .describe(
         'Skill names to disable completely. Disabled skills are not granted to agents, even when referenced by presets or agent overrides.',
       ),
-    // Multiplexer config (new unified config - preferred)
+    // Multiplexer config
     multiplexer: MultiplexerConfigSchema.optional(),
-    // Legacy tmux config (for backward compatibility)
-    // When tmux.enabled is true, it's equivalent to multiplexer.type = 'tmux'
-    tmux: TmuxConfigSchema.optional(),
-    websearch: WebsearchConfigSchema.optional(),
     interview: InterviewConfigSchema.optional(),
     backgroundJobs: BackgroundJobsConfigSchema.optional(),
     fallback: FailoverConfigSchema.optional(),
     council: CouncilConfigSchema.optional(),
     companion: CompanionConfigSchema.optional(),
+    webfetch: WebfetchConfigSchema.optional(),
     acpAgents: AcpAgentsConfigSchema.optional(),
   })
   .superRefine((value, ctx) => {

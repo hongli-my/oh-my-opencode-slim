@@ -2,93 +2,283 @@
 
 ## Responsibility
 
-`src/tools/` exposes plugin tooling and runtime command hooks used by OpenCode.
+Centralized tool factory and registry for the OpenCode plugin system. This directory defines all executable tools exposed to OpenCode agents, including:
 
-- AST-aware search/replace via `ast-grep` stack.
-- Remote fetch/transform utility via `smartfetch` (`webfetch` tool).
-- Council orchestration via `createCouncilTool` (`council.ts`).
-- (No custom subtask feature in V2 — use native background `task` plus hook-driven completion)
-- Runtime preset switching via `/preset` hook via `createPresetManager` (`preset-manager.ts`).
+- **Agent orchestration tools**: Multi-LLM council synthesis, background task lifecycle controls, and ACP agent execution
+- **Code intelligence tools**: AST-grep pattern matching and transformation across languages
+- **Web capabilities**: Smart web fetching with caching and secondary model processing
+- **Runtime configuration**: Preset management for dynamic agent configuration switching
 
-It is the bridge between plugin runtime integration (`src/index.ts`) and the lower-level
-implementations in feature folders.
+These tools enable agents to perform file operations, orchestrate multi-model consensus, manage background tasks, and interact with external systems while maintaining security boundaries through the OpenCode tool schema.
 
-## Export surface (`src/tools/index.ts`)
+## Design
 
-- `ast_grep_search`, `ast_grep_replace` from `./ast-grep`
-- `createWebfetchTool`, `WEBFETCH_DESCRIPTION`, and related types from `./smartfetch`
-- `createCouncilTool`
+### Architecture Pattern: **Tool Factory Pattern**
 
-- `createPresetManager` and `PresetManager` type
+Each tool is implemented as a factory function that returns a `ToolDefinition` record compatible with the `@opencode-ai/plugin` SDK. The pattern provides:
 
-## Design patterns
+- **Encapsulation**: Tool creation logic and dependencies are isolated per tool
+- **Composition**: Tools can be selectively exported and composed in `src/tools/index.ts`
+- **Testability**: Factories accept dependencies as parameters, enabling mock injection
+- **Type Safety**: Zod schemas validate tool arguments at runtime
 
-- **Factory-based registration:** each feature exposes a factory that returns an
-  executable/tool or handler object bound to plugin context.
-- **Clear boundaries:** all plugin lifecycle hooks are emitted from factory methods
-  (`handleCommandExecuteBefore`, `handleEvent`, `registerCommand`) rather than in tool
-  modules.
-- **Metadata-first output:** tool calls return text plus internal metadata writes when
-  possible (for richer UI surfaces).
+### Core Tool Families
 
-## Subsystems and data flow
+| Tool Family | Purpose | Key Components |
+|------------|---------|----------------|
+| **Council** | Multi-LLM consensus synthesis (orchestrator dispatches councillors as subagents) | `agents/council.ts`, `agents/index.ts` |
+| **Task Management** | Background task communication, cancellation, status, results, revival, and HITL continuation control | `task-message.ts`, `cancel-task.ts`, `task-status.ts`, `task-result.ts`, `task-revive.ts`, `wait-for-user.ts`, `background-job-board.ts` |
+| **ACP Integration** | External agent protocol execution | `acp-run.ts`, ACP client implementation |
+| **Code Intelligence** | AST-based code manipulation | `ast-grep/` directory, `tools.ts` |
+| **Web Fetching** | Intelligent web content retrieval | `smartfetch/` directory, `tool.ts` |
+| **Preset Management** | Runtime agent configuration | `preset-manager.ts`, TUI state integration |
 
-### Council tool path
+### Security & Validation
 
-- `createCouncilTool` defines `council_session`.
-- `execute` performs guarded invocation:
-  - validates `toolContext` and `sessionID`,
-  - only allows direct use by `agent: 'council'` (or missing agent for backward compatibility),
-  - calls `CouncilManager.runCouncil(prompt, preset, parentSessionId)`.
-- On success, appends a councillor response summary and normalized model list to output.
-- On failure, returns a concise error string.
-- Shows config deprecation warnings when `CouncilManager` exposes deprecated field metadata.
+- **Agent Restrictions**: Tools validate calling agent identity and configured permissions
+- **Permission Prompts**: Web fetching and ACP tools require explicit user permission via `ctx.ask()`
+- **Timeout Controls**: Configurable timeouts prevent unbounded execution
+- **Input Sanitization**: Zod schemas validate all tool arguments
 
-### Preset-manager command path
+### State Management
 
-- `createPresetManager(ctx, config)` returns:
-  - `registerCommand(opencodeConfig)`: injects `/preset` command definition if absent,
-  - `handleCommandExecuteBefore(input, output)`: intercepts `/preset` command handling.
-- Command behavior:
-  - no args → clear output and list available presets (`active` marker supported),
-  - single token arg → switch preset through `client.config.update(...)` with mapped agent overrides,
-  - multi-word arg → suggestion + no update.
-- Mapping logic converts plugin preset override format (`AgentOverrideConfig`) into runtime
-  SDK `agent` config (`model`, `temperature`, `variant`, `options`) and skips fields not
-  supported in runtime updates (`prompt`, `orchestratorPrompt`, `skills`, `mcps`,
-  `displayName`).
-- In-memory `activePreset` supports immediate status display and updates after successful switches.
+- **Runtime Presets**: Preset state persists across plugin reloads via `RuntimeConfig` (`src/config/runtime.ts`)
+- **TUI Integration**: Preset changes persist to the config file only; the sidebar is NOT refreshed mid-session (the agent registry is unchanged until reload) — hot-swapping the agent tree during an active conversation risks context truncation, drifted prior turns, and stale subagent references
+- **Background Jobs**: Task communication, cancellation, status, results, and revival use a centralized job board for tracking and lifecycle coordination
 
-### Smartfetch path
+## Flow
 
-- `createWebfetchTool` owns fetch orchestration, permission prompts, cache checks,
-  llms.txt probing, binary/text branching, and optional secondary-model post-processing.
-- `smartfetch` modules split work into:
-  - transport/policy (`network.ts`),
-  - cache + TTL semantics (`cache.ts`),
-  - output shaping (`utils.ts`),
-  - file-backed binaries (`binary.ts`),
-  - secondary-model summarization (`secondary-model.ts`),
-  - constants and types.
-- `webfetch` is always registered from `src/index.ts` as a public tool.
+### Tool Creation Lifecycle
 
-### AST-grep path
+```
+1. Plugin Initialization (src/index.ts)
+   └─> registerTools() calls each tool factory with dependencies
+      
+2. Tool Factory Execution
+   ├─> Accepts PluginInput context and domain-specific dependencies
+   ├─> Validates configuration and environment
+   ├─> Returns ToolDefinition record with execute() handler
+   └─> Registers tool with OpenCode via plugin API
 
-- `ast-grep` is split into CLI/CLI-discovery and tool-definition concerns.
-- `ast_grep_search`/`ast_grep_replace` execution calls into `runSg`, which handles
-  argument normalization, binary availability, timeout/error handling, and output truncation.
-- `src/tools/ast-grep/index.ts` re-exports tool definitions and utility helpers for
-  discoverability (`ensureCliAvailable`, `getAstGrepPath`, downloader/runtime checks).
+3. Tool Invocation
+   ├─> Agent calls tool with validated arguments
+   ├─> Tool executes business logic
+   ├─> May call ctx.ask() for user permission
+   ├─> Returns structured result or error
+   └─> OpenCode presents result to agent
+```
 
-## Integration points in `src/index.ts`
+### Task Control Flows
 
-- Tool registration:
-  - `council` tools (only when `config.council` exists),
-  - `webfetch`,
+```
+1. Orchestrator invokes task_cancel
+   ├─> Validates calling agent is 'orchestrator'
+   ├─> Resolves task_id to BackgroundJobBoard entry
+   ├─> Calls abortSessionWithTimeout() to signal cancellation
+   ├─> Verifies session stopped via status polling
+   ├─> Marks job as cancelled in BackgroundJobBoard
+   └─> Returns cancellation confirmation while retaining the child session
+
+2. Orchestrator invokes task_message
+   ├─> Resolves task_id to a live BackgroundJobBoard entry
+   ├─> Acquires a generation-scoped message lease
+   ├─> Queues a bounded no-reply message without interrupting or resuming the child
+   └─> Returns transport-confirmed queue status
+
+3. Orchestrator invokes task_revive
+   ├─> Resolves the retained BackgroundJobBoard entry
+   ├─> Cancels a running generation when necessary
+   ├─> Launches a new prompt in the existing child session
+   ├─> Registers the new generation and tracks its completion
+   └─> Returns the new running generation
+```
+
+### Explicit User-Wait Flow
+
+```
+1. Orchestrator gives the user concrete manual steps
+   └─> Invokes wait_for_user as its final tool action
+       ├─> Validates session ID, agent identity, and managed-session ownership
+       ├─> Arms task-session-manager.beginUserWait()
+       ├─> Revokes pending automatic-continuation reservations
+       └─> Returns the versioned waiting_for_user protocol marker
+```
+
+### ACP Agent Execution Flow
+
+```
+1. Agent invokes acp_run tool
+   ├─> Validates calling agent matches configured agent name
+   ├─> Spawns ACP client process with config
+   ├─> Sends prompt via JSON-RPC over stdin/stdout
+   ├─> Handles permission requests via ctx.ask()
+   ├─> Collects streaming output chunks
+   ├─> Enforces timeout if configured
+   └─> Returns concatenated output or error
+```
+
+### AST-grep Pattern Matching Flow
+
+```
+1. Agent invokes ast_grep_search or ast_grep_replace
+   ├─> Validates language support and pattern syntax
+   ├─> Ensures CLI binary available (downloads if needed)
+   ├─> Executes sg (AST-grep CLI) process
+   ├─> Parses JSON output into structured matches/edits
+   └─> Returns typed results to agent
+```
+
+### Web Fetching Flow
+
+```
+1. Agent invokes webfetch tool
+   ├─> Validates URL and configuration
+   ├─> Checks cache for fresh content
+   ├─> If cache miss, fetches via network with timeout
+   ├─> Optionally processes with secondary model
+   ├─> Caches result for future requests
+   └─> Returns extracted content to agent
+```
+
+## Integration
+
+
+### Consumers
+
+- **Main Plugin** (`src/index.ts`):
+  - `registerTools()` - Registers all exported tools with OpenCode
+  - `getToolDefinitions()` - Composes tool set for plugin initialization
   
-  - AST tools.
-- `presetManager` is initialized in plugin init and:
-  - calls `registerCommand` during config hook,
-  - handles command interception in `command.execute.before`.
-- `/preset` handling is explicitly user-facing (command hook), while webfetch and
-  council are tool-facing.
+- **Agents** (`src/agents/`):
+  - Orchestrator dispatches councillors as subagents
+  - Council agent synthesizes councillor responses
+  - Individual agents use `acp_run` tool for specialized tasks
+  - All agents use `ast_grep_search`/`ast_grep_replace` for code manipulation
+
+- **CLI** (`src/cli/`):
+  - Preset manager integrates with `/preset` command
+  - Tool factories receive CLI configuration for ACP agents
+
+### Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `@opencode-ai/plugin` | Tool schema and execution framework |
+| `Council Config` (`src/config/council-schema.ts`) | Councillor model/preset definitions |
+| `BackgroundJobBoard` (`src/utils/`) | Background task tracking and cleanup |
+| `Config System` (`src/config/`) | ACP agent configurations and presets |
+| `TUI State` (`src/tui-state.ts`) | Preset visualization in terminal UI |
+| `AST-grep CLI` | Pattern matching and transformation engine |
+| `Network Utilities` | Web fetching and caching |
+
+### Cross-Module Data Flow
+
+```
+Tools Layer → Background Layer
+├─ task_cancel → BackgroundJobBoard.resolve() → abortSessionWithTimeout()
+├─ task_message → BackgroundJobBoard.resolve() → no-reply prompt transport
+├─ task_revive → BackgroundJobBoard.resolve() → retained-session relaunch
+└─> Returns lifecycle or transport status
+
+Tools Layer → Config Layer
+├─ acp_run tool → AcpAgentsConfig from config system
+├─ preset-manager → Preset configurations from plugin config
+└─> Validates and applies runtime configuration
+
+Tools Layer → AST-grep Layer
+├─ ast_grep_search/ast_grep_replace → CLI binary execution
+└─> Returns typed AST matches and edit results
+
+Tools Layer → Web Layer
+└─ webfetch tool → Network utilities with caching and model processing
+```
+
+### Configuration Integration
+
+- **ACP Agents**: Defined in `src/config/agents.ts`, consumed by `acp_run.ts`
+- **Presets**: Defined in plugin config (`oh-my-opencode-slim.jsonc`), managed by `preset-manager.ts`
+- **Council**: Configured via council presets, validated by `council.ts`
+
+
+### Error Handling & Recovery
+
+- **Session Aborts**: `cancel-task.ts` implements robust abort verification with polling and cleanup
+- **Timeouts**: All network and process operations enforce configurable timeouts
+- **Permission Denials**: Tools gracefully handle user rejection via `ctx.ask()`
+- **Binary Availability**: `ast-grep/` tools auto-download CLI on first use
+
+
+## Tool Reference
+
+### Exported Tools (src/tools/index.ts)
+
+```typescript
+// AST-grep tools
+export { createAcpRunTool } from './acp-run';
+export { ast_grep_replace, ast_grep_search } from './ast-grep';
+
+// Task management
+export { createCancelTaskTool } from './cancel-task';
+export { createTaskMessageTool } from './task-message';
+export { createTaskResultTool } from './task-result';
+export { createTaskReviveTool } from './task-revive';
+export { createTaskStatusTool } from './task-status';
+export { createWaitForUserTool } from './wait-for-user';
+
+// Preset management
+export type { PresetManager } from './preset-manager';
+export { createPresetManager } from './preset-manager';
+
+// Web fetching
+export { createWebfetchTool } from './smartfetch';
+```
+
+### Tool-Specific Configuration
+
+
+#### ACP Agents (acp-run.ts)
+- Configured in `src/config/agents.ts` as `AcpAgentsConfig`
+- Each agent requires: `command`, `args`, `cwd`, `permissionMode`
+- Supports: `ask` (prompt user), `reject` (auto-deny), `allow` (auto-approve)
+
+#### Council Sessions
+- Configured via council presets in plugin config
+- Orchestrator dispatches each councillor as a prefixed subagent (`councillor-<name>`)
+- Council agent synthesizes responses into a consensus report
+
+#### Presets (preset-manager.ts)
+- Defined in plugin config under `presets` field
+- Each preset maps agent names to `AgentOverrideConfig`
+- Changes persist across plugin reloads via user config file
+
+#### AST-grep (ast-grep/)
+- Auto-downloads CLI binary on first use
+- Supports 25+ languages via CLI_LANGUAGES constant
+- Provides search (pattern matching) and replace (transformation) tools
+
+#### Webfetch (smartfetch/)
+- Implements caching with configurable TTL
+- Supports secondary model processing for content extraction
+- Handles redirects, timeouts, and error recovery
+
+## Testing Strategy
+
+- **Unit Tests**: Individual tool factories tested in `*.test.ts` files
+- **Integration Tests**: Tools tested with mock dependencies and OpenCode context
+- **E2E Tests**: ACP tools tested with real external services
+- **Binary Tests**: AST-grep CLI availability and functionality verified
+
+## Performance Considerations
+
+- **Binary Downloads**: AST-grep CLI downloaded once and cached
+- **Network Caching**: Webfetch results cached to avoid redundant requests
+- **Timeout Enforcement**: Prevents unbounded execution of external tools
+- **Parallel Execution**: Councillors run as parallel subagent tasks
+
+## Security Considerations
+
+- **Agent Restrictions**: Tools validate calling agent identity
+- **Permission Prompts**: User approval required for web and ACP operations
+- **Input Validation**: Zod schemas validate all tool arguments
+- **Process Isolation**: ACP agents run in separate processes
+- **Timeout Controls**: Prevents denial-of-service via hanging operations

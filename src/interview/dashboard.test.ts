@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
 import { createServer, get } from 'node:http';
 import * as path from 'node:path';
@@ -371,6 +371,71 @@ describe('dashboard server', () => {
         cleanup();
       }
     });
+
+    test('unregisters a session and removes its cached interviews', async () => {
+      const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
+      try {
+        dashboard.registerSession({
+          sessionID: 'session-unregister',
+          directory: '/test/directory',
+          pid: 12345,
+          registeredAt: Date.now(),
+        });
+        dashboard.pushState({
+          interviewId: 'unregister-interview',
+          sessionID: 'session-unregister',
+          idea: 'Unregister me',
+          mode: 'awaiting-user',
+          summary: 'Test',
+          title: 'Unregister me',
+          questions: [],
+          pendingAnswers: null,
+          lastUpdatedAt: Date.now(),
+          filePath: '',
+          nudgeAction: null,
+        });
+
+        const response = await fetch(`${baseUrl}/api/unregister`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${authToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ sessionID: 'session-unregister' }),
+        });
+        expect(response.status).toBe(200);
+        expect((await response.json()).status).toBe('unregistered');
+        expect(dashboard.getState('unregister-interview')).toBeUndefined();
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe('session discovery', () => {
+    test('uses the nested SDK query shape', async () => {
+      const list = mock(async () => ({
+        data: [
+          {
+            directory: '/discovered/project',
+            time: { updated: Date.now() },
+          },
+        ],
+      }));
+      const dashboard = createDashboardServer({
+        port: 0,
+        outputFolder: 'interview',
+        sessionClient: { list },
+      });
+
+      try {
+        await dashboard.discoverSessionDirectories();
+
+        expect(list).toHaveBeenCalledWith({ query: {} });
+      } finally {
+        dashboard.close();
+      }
+    });
   });
 
   describe('create interview (POST /api/interviews)', () => {
@@ -702,7 +767,8 @@ describe('dashboard server', () => {
             headers: { 'content-type': 'application/json' },
           },
         );
-        expect(response.status).toBe(200);
+        expect(response.status).toBe(202);
+        expect((await response.json()).status).toBe('queued');
 
         // Verify answers are stored
         const state = dashboard.getState('answers-test');
@@ -731,7 +797,7 @@ describe('dashboard server', () => {
           nudgeAction: null,
         });
 
-        await fetch(
+        const response = await fetch(
           `${baseUrl}/api/interviews/mode-test/answers?token=${authToken}`,
           {
             method: 'POST',
@@ -741,6 +807,7 @@ describe('dashboard server', () => {
             headers: { 'content-type': 'application/json' },
           },
         );
+        expect(response.status).toBe(202);
 
         const state = dashboard.getState('mode-test');
         expect(state?.mode).toBe('awaiting-agent');
@@ -785,6 +852,53 @@ describe('dashboard server', () => {
   });
 
   describe('consume pending answers (GET /api/interviews/:id/pending)', () => {
+    test('rolls a claim back without losing the queued answer', async () => {
+      const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
+      try {
+        dashboard.pushState({
+          interviewId: 'rollback-test',
+          sessionID: 'session-rollback',
+          idea: 'Rollback Test',
+          mode: 'awaiting-user',
+          summary: 'Test',
+          title: 'Rollback Test',
+          questions: [],
+          pendingAnswers: null,
+          lastUpdatedAt: Date.now(),
+          filePath: '',
+          nudgeAction: null,
+        });
+        await fetch(
+          `${baseUrl}/api/interviews/rollback-test/answers?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              answers: [{ questionId: 'q-1', answer: 'A' }],
+            }),
+          },
+        );
+        const claimed = await fetch(
+          `${baseUrl}/api/interviews/rollback-test/pending?token=${authToken}`,
+        );
+        const claim = (await claimed.json()) as { claimId: string };
+        const rollback = await fetch(
+          `${baseUrl}/api/interviews/rollback-test/pending/rollback?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ claimId: claim.claimId }),
+          },
+        );
+        expect(rollback.status).toBe(200);
+        expect(dashboard.getState('rollback-test')?.pendingAnswers).toEqual([
+          { questionId: 'q-1', answer: 'A' },
+        ]);
+      } finally {
+        cleanup();
+      }
+    });
+
     test('returns and clears pending answers atomically', async () => {
       const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
       try {
@@ -809,8 +923,19 @@ describe('dashboard server', () => {
         );
         const data1 = (await response1.json()) as {
           answers: Array<{ questionId: string; answer: string }> | null;
+          claimId: string;
         };
         expect(data1.answers).toEqual([{ questionId: 'q-1', answer: 'A' }]);
+
+        const ack = await fetch(
+          `${baseUrl}/api/interviews/pending-test/pending/ack?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ claimId: data1.claimId }),
+          },
+        );
+        expect(ack.status).toBe(200);
 
         // Verify state was cleared
         const state = dashboard.getState('pending-test');
@@ -842,6 +967,19 @@ describe('dashboard server', () => {
           `${baseUrl}/api/interviews/consume-test/pending?token=${authToken}`,
         );
 
+        const first = await fetch(
+          `${baseUrl}/api/interviews/consume-test/pending?token=${authToken}`,
+        );
+        const firstData = (await first.json()) as { claimId: string };
+        await fetch(
+          `${baseUrl}/api/interviews/consume-test/pending/ack?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ claimId: firstData.claimId }),
+          },
+        );
+
         // Second call - should return null
         const response2 = await fetch(
           `${baseUrl}/api/interviews/consume-test/pending?token=${authToken}`,
@@ -850,6 +988,72 @@ describe('dashboard server', () => {
           answers: Array<{ questionId: string; answer: string }> | null;
         };
         expect(data2.answers).toBeNull();
+      } finally {
+        cleanup();
+      }
+    });
+
+    test('reuses one claim across overlapping polls', async () => {
+      const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
+      try {
+        dashboard.pushState({
+          interviewId: 'overlap-test',
+          sessionID: 'session-overlap',
+          idea: 'Overlap Test',
+          mode: 'awaiting-agent',
+          summary: 'Test',
+          title: 'Overlap Test',
+          questions: [],
+          pendingAnswers: [{ questionId: 'q-1', answer: 'A' }],
+          lastUpdatedAt: Date.now(),
+          filePath: '',
+          nudgeAction: null,
+        });
+
+        const responses = await Promise.all([
+          fetch(
+            `${baseUrl}/api/interviews/overlap-test/pending?token=${authToken}`,
+          ),
+          fetch(
+            `${baseUrl}/api/interviews/overlap-test/pending?token=${authToken}`,
+          ),
+        ]);
+        const claims = await Promise.all(
+          responses.map(async (response) => {
+            expect(response.status).toBe(200);
+            return (await response.json()) as {
+              claimId: string;
+              answers: Array<{ questionId: string; answer: string }> | null;
+            };
+          }),
+        );
+
+        expect(claims[0]?.claimId).toBe(claims[1]?.claimId);
+        expect(claims[0]?.answers).toEqual([
+          { questionId: 'q-1', answer: 'A' },
+        ]);
+        expect(claims[1]?.answers).toEqual(claims[0]?.answers);
+
+        const ackResponses = await Promise.all(
+          claims.map((claim) =>
+            fetch(
+              `${baseUrl}/api/interviews/overlap-test/pending/ack?token=${authToken}`,
+              {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ claimId: claim.claimId }),
+              },
+            ),
+          ),
+        );
+        expect(ackResponses.map((response) => response.status).sort()).toEqual([
+          200, 409,
+        ]);
+
+        const afterAck = await fetch(
+          `${baseUrl}/api/interviews/overlap-test/pending?token=${authToken}`,
+        );
+        expect((await afterAck.json()).answers).toBeNull();
       } finally {
         cleanup();
       }
@@ -894,7 +1098,8 @@ describe('dashboard server', () => {
             headers: { 'content-type': 'application/json' },
           },
         );
-        expect(response.status).toBe(200);
+        expect(response.status).toBe(202);
+        expect((await response.json()).status).toBe('queued');
 
         const state = dashboard.getState('nudge-test');
         expect(state?.nudgeAction).toBe('more-questions');
@@ -992,8 +1197,19 @@ describe('dashboard server', () => {
         );
         const data = (await response.json()) as {
           action: 'more-questions' | 'confirm-complete' | null;
+          claimId: string;
         };
         expect(data.action).toBe('more-questions');
+
+        const ack = await fetch(
+          `${baseUrl}/api/interviews/consume-nudge-test/nudge/ack?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ claimId: data.claimId }),
+          },
+        );
+        expect(ack.status).toBe(200);
 
         const state = dashboard.getState('consume-nudge-test');
         expect(state?.nudgeAction).toBeNull();
@@ -1022,6 +1238,19 @@ describe('dashboard server', () => {
         // First call
         await fetch(
           `${baseUrl}/api/interviews/nudge-second-test/nudge?token=${authToken}`,
+        );
+
+        const first = await fetch(
+          `${baseUrl}/api/interviews/nudge-second-test/nudge?token=${authToken}`,
+        );
+        const firstData = (await first.json()) as { claimId: string };
+        await fetch(
+          `${baseUrl}/api/interviews/nudge-second-test/nudge/ack?token=${authToken}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ claimId: firstData.claimId }),
+          },
         );
 
         // Second call
@@ -1269,6 +1498,112 @@ describe('dashboard server', () => {
         expect(state?.pendingAnswers).toEqual([
           { questionId: 'q-1', answer: 'Direct' },
         ]);
+      } finally {
+        cleanup();
+      }
+    });
+
+    test('in-process claims can roll back and then acknowledge delivery', async () => {
+      const { dashboard, cleanup } = await startDashboard();
+      try {
+        dashboard.pushState({
+          interviewId: 'claim-direct',
+          sessionID: 'session-claim-direct',
+          idea: 'Claim Direct',
+          mode: 'awaiting-agent',
+          summary: 'Claim',
+          title: 'Claim Direct',
+          questions: [],
+          pendingAnswers: [{ questionId: 'q-1', answer: 'Test' }],
+          lastUpdatedAt: Date.now(),
+          filePath: '',
+          nudgeAction: null,
+        });
+
+        const first = dashboard.claimPendingAnswers('claim-direct');
+        expect(first?.answers).toEqual([{ questionId: 'q-1', answer: 'Test' }]);
+        expect(
+          dashboard.rollbackPending(
+            'claim-direct',
+            'answers',
+            first?.claimId ?? '',
+          ),
+        ).toBe(true);
+
+        const second = dashboard.claimPendingAnswers('claim-direct');
+        expect(second?.answers).toEqual(first?.answers);
+        expect(
+          dashboard.acknowledgePending(
+            'claim-direct',
+            'answers',
+            second?.claimId ?? '',
+          ),
+        ).toBe(true);
+        expect(dashboard.getState('claim-direct')?.pendingAnswers).toBeNull();
+      } finally {
+        cleanup();
+      }
+    });
+
+    test('rollback preserves every queued action kind', async () => {
+      const { dashboard, cleanup } = await startDashboard();
+      try {
+        dashboard.pushState({
+          interviewId: 'all-claims',
+          sessionID: 'session-all-claims',
+          idea: 'All Claims',
+          mode: 'awaiting-agent',
+          summary: 'Claims',
+          title: 'All Claims',
+          questions: [],
+          pendingAnswers: [{ questionId: 'q-1', answer: 'A' }],
+          lastUpdatedAt: Date.now(),
+          filePath: '',
+          nudgeAction: 'confirm-complete',
+          pendingBlockComment: { section: 'Purpose', comment: 'Clarify' },
+          pendingChatMessage: 'Please revise this.',
+        });
+
+        const answers = dashboard.claimPendingAnswers('all-claims');
+        const nudge = dashboard.claimNudgeAction('all-claims');
+        const comment = dashboard.claimBlockComment('all-claims');
+        const chat = dashboard.claimChatMessage('all-claims');
+        expect(answers && nudge && comment && chat).toBeTruthy();
+        expect(
+          dashboard.rollbackPending(
+            'all-claims',
+            'answers',
+            answers?.claimId ?? '',
+          ),
+        ).toBe(true);
+        expect(
+          dashboard.rollbackPending(
+            'all-claims',
+            'nudge',
+            nudge?.claimId ?? '',
+          ),
+        ).toBe(true);
+        expect(
+          dashboard.rollbackPending(
+            'all-claims',
+            'block-comment',
+            comment?.claimId ?? '',
+          ),
+        ).toBe(true);
+        expect(
+          dashboard.rollbackPending('all-claims', 'chat', chat?.claimId ?? ''),
+        ).toBe(true);
+
+        const state = dashboard.getState('all-claims');
+        expect(state?.pendingAnswers).toEqual([
+          { questionId: 'q-1', answer: 'A' },
+        ]);
+        expect(state?.nudgeAction).toBe('confirm-complete');
+        expect(state?.pendingBlockComment).toEqual({
+          section: 'Purpose',
+          comment: 'Clarify',
+        });
+        expect(state?.pendingChatMessage).toBe('Please revise this.');
       } finally {
         cleanup();
       }

@@ -19,7 +19,7 @@ This is the exact configuration the author runs day-to-day.
   "presets": {
     "openai": {
       "orchestrator": {
-        "model": "openai/gpt-5.5-fast",
+        "model": "openai/gpt-5.6-fast",
         "skills": [
           "*",
           "!make-interfaces-feel-better"
@@ -27,12 +27,11 @@ This is the exact configuration the author runs day-to-day.
         "mcps": [
           "*",
           "!context7",
-          "!gh_app",
-          "!websearch"
+          "!gh_app"
         ]
       },
       "oracle": {
-        "model": "openai/gpt-5.5-fast",
+        "model": "openai/gpt-5.6-fast",
         "variant": "high",
         "skills": [
           "ce-brainstorm",
@@ -52,7 +51,6 @@ This is the exact configuration the author runs day-to-day.
           "customer-research"
         ],
         "mcps": [
-          "websearch",
           "context7",
           "gh_app",
           "searxng",
@@ -84,8 +82,7 @@ This is the exact configuration the author runs day-to-day.
         ]
       },
       "fixer": {
-        "model": "omniroute/antigravity/gemini-3-flash-agent",
-        "variant": "low",
+        "model": "xai/grok-4.5",
         "skills": [
           "vitest",
           "pnpm",
@@ -110,6 +107,16 @@ This is the exact configuration the author runs day-to-day.
       "mcps": []
     }
   },
+  "acpAgents": {
+    "claude-acp": {
+      "command": "npx",
+      "args": ["-y", "@agentclientprotocol/claude-agent-acp"],
+      "description": "Claude ACP agent for launching Claude Code",
+      "wrapperModel": "openai/gpt-5.6-luna-fast",
+      "permissionMode": "allow",
+      "timeoutMs": 0
+    }
+  },
   "tmux": {
     "enabled": true,
     "layout": "main-vertical",
@@ -118,3 +125,34 @@ This is the exact configuration the author runs day-to-day.
 }
 
 ```
+
+## Skill Reference
+
+Each skill is listed with a short description and its source. The config block above shows which agent uses it. `author` means the author's own third party skill (not part of the plugin); `public` means a public tool, framework, or MCP server.
+
+| Skill | Description | Source |
+| --- | --- | --- |
+| `*` (excl. `!make-interfaces-feel-better`) | All installed skills except those explicitly excluded | `author` |
+| `better-icons` | Icon design | `author` |
+| `ce-brainstorm` | Brainstorming workflow | `author` |
+| `codegraph` | (MCP) code graph navigation | `public` |
+| `context7` | (MCP) library docs lookup | `public` |
+| `crawl4ai` | (MCP) web crawling | `public` |
+| `customer-research` | Customer research | `author` |
+| `gh_app` | (MCP) GitHub app access | `public` |
+| `image` | Image generation/editing | `author` |
+| `make-interfaces-feel-better` | UI/UX polish | `author` |
+| `marketing-psychology` | Marketing psychology | `author` |
+| `motion` | Animation/motion design | `author` |
+| `nuxt` | Nuxt framework | `public` |
+| `pnpm` | pnpm package manager | `public` |
+| `searxng` | (MCP) metasearch engine | `public` |
+| `tsdown` | tsdown bundler | `public` |
+| `video` | Video generation/editing | `author` |
+| `vitest` | Vitest test runner | `public` |
+| `vite` | Vite build tool | `public` |
+| `vue` | Vue framework | `public` |
+| `web-perf` | Web performance optimization | `author` |
+| `workers-best-practices` | Worker best practices | `author` |
+
+For the complete configuration reference, see [Configuration](configuration.md).

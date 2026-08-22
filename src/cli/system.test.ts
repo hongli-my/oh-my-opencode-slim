@@ -1,13 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, mock, test } from 'bun:test';
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,27 +9,26 @@ import {
   getOpenCodeVersion,
   isOpenCodeInstalled,
   isTmuxInstalled,
+  resolveOpenCodePath,
 } from './system';
 
 describe('system', () => {
-  test('isOpenCodeInstalled detects opencode in ~/.opencode/bin', async () => {
+  test('resolves opencode in ~/.opencode/bin', () => {
     const dir = mkdtempSync(join(tmpdir(), 'opencode-system-test-'));
-    const originalPath = process.env.PATH;
-    const originalHome = process.env.HOME;
 
     try {
       const opencodePath = join(dir, '.opencode', 'bin', 'opencode');
       mkdirSync(join(dir, '.opencode', 'bin'), { recursive: true });
-      writeFileSync(opencodePath, '#!/bin/sh\necho 1.2.3\n');
-      chmodSync(opencodePath, 0o755);
-      process.env.HOME = dir;
-      process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+      writeFileSync(opencodePath, 'placeholder');
 
-      const system = await import(`./system?test=home-detect-${Date.now()}`);
-      expect(await system.isOpenCodeInstalled()).toBe(true);
+      expect(
+        resolveOpenCodePath({
+          ...process.env,
+          HOME: dir,
+          PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+        }),
+      ).toBe(opencodePath);
     } finally {
-      process.env.PATH = originalPath;
-      process.env.HOME = originalHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });

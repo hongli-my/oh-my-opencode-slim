@@ -286,6 +286,39 @@ describe('companion updater', () => {
       }
     }
   });
+
+  test('returns null on corrupt manifest without throwing', () => {
+    const brokenDir = path.join(TEST_DIR, 'broken-manifest');
+    mkdirSync(path.join(brokenDir, 'src', 'companion'), { recursive: true });
+    writeFileSync(
+      path.join(brokenDir, 'src', 'companion', 'companion-manifest.json'),
+      'not-json',
+    );
+
+    const result = loadCompanionManifestFromPackageRoot(brokenDir);
+
+    // Must gracefully return null instead of throwing
+    expect(result).toBeNull();
+  });
+
+  test('fails gracefully when metadata file is corrupt', () => {
+    const bin = getCompanionBinaryPath();
+    mkdirSync(path.dirname(bin), { recursive: true });
+    writeFileSync(`${bin}.json`, 'not-json');
+
+    const result = ensureCompanionVersion({
+      config: { enabled: true },
+      manifest: {
+        version: '0.2.0',
+        tag: 'companion-v0.2.0',
+        repo: 'owner/repo',
+        checksums: {},
+      },
+      lockTimeoutMs: 1,
+    });
+
+    expect(result).resolves.toMatchObject({ status: 'failed' });
+  });
 });
 
 function archiveName(version: string, target: string): string {
